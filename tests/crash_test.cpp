@@ -8,7 +8,8 @@
 //   * the tree passes the full integrity check, and
 //   * its contents equal the model after every acknowledged operation
 //     (optionally plus the single in-flight operation, which may or may not
-//     have become durable before the crash).
+//     have become durable before the crash). Some operations are batches,
+//     which must appear entirely or not at all.
 //
 // Usage:
 //   crash_test                 targeted scenarios + 40 randomized runs
@@ -38,22 +39,27 @@ namespace {
 
 constexpr int kNumOps = 800;
 
+// One step of the workload: a single put/delete, or an atomic batch.
 struct Op {
-  bool is_put;
-  std::string key;
-  std::string value;
+  WriteBatch batch;
 };
 
 std::vector<Op> makeOps(unsigned seed) {
   std::mt19937 rng(seed);
-  std::vector<Op> ops;
+  std::vector<Op> ops(kNumOps);
   for (int i = 0; i < kNumOps; i++) {
-    char key[32];
-    std::snprintf(key, sizeof key, "k%05u", static_cast<unsigned>(rng() % 400));
-    if (i > 50 && rng() % 4 == 0) {
-      ops.push_back({false, key, ""});
-    } else {
-      ops.push_back({true, key, "v" + std::to_string(i) + std::string(rng() % 150, '#')});
+    // Most steps are a single operation; one in five is a batch of 2-4.
+    int n = rng() % 5 == 0 ? 2 + static_cast<int>(rng() % 3) : 1;
+    for (int j = 0; j < n; j++) {
+      char key[32];
+      std::snprintf(key, sizeof key, "k%05u", static_cast<unsigned>(rng() % 400));
+      if (i > 50 && rng() % 4 == 0) {
+        ops[i].batch.remove(key);
+      } else {
+        // Occasionally a value large enough to need overflow pages.
+        size_t len = rng() % 20 == 0 ? 600 + rng() % 6000 : rng() % 150;
+        ops[i].batch.put(key, "v" + std::to_string(i) + std::string(len, '#'));
+      }
     }
   }
   return ops;
@@ -83,10 +89,13 @@ int runWorkload(const std::string& dir, const std::string& fp, long count, unsig
   {
     DB db(dir, childOptions());
     for (int i = 0; i < kNumOps; i++) {
-      if (ops[i].is_put) {
-        db.put(ops[i].key, ops[i].value);
+      const WriteBatch& b = ops[i].batch;
+      if (b.count() > 1) {
+        db.write(b);
+      } else if (b.entries()[0].op == WalOp::Put) {
+        db.put(b.entries()[0].key, b.entries()[0].value);
       } else {
-        db.remove(ops[i].key);
+        db.remove(b.entries()[0].key);
       }
       std::fprintf(ack, "%d\n", i);  // op i is acknowledged
       std::fflush(ack);
@@ -140,10 +149,12 @@ int readAcked(const std::string& dir) {
 }
 
 void applyOp(std::map<std::string, std::string>& m, const Op& op) {
-  if (op.is_put) {
-    m[op.key] = op.value;
-  } else {
-    m.erase(op.key);
+  for (const WriteBatch::Entry& e : op.batch.entries()) {
+    if (e.op == WalOp::Put) {
+      m[e.key] = e.value;
+    } else {
+      m.erase(e.key);
+    }
   }
 }
 

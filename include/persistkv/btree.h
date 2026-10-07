@@ -9,18 +9,29 @@
 
 namespace pkv {
 
-// Node capacities, derived so that a full node always fits in one page.
-constexpr uint32_t kLeafEntryMaxSize = 2 + kMaxKeySize + 2 + kMaxValueSize;
-constexpr uint32_t kLeafMaxKeys = (kPageSize - kPageHeaderSize) / kLeafEntryMaxSize;
-constexpr uint32_t kLeafMinKeys = kLeafMaxKeys / 2;
-constexpr uint32_t kInternalMaxKeys = (kPageSize - kPageHeaderSize - 4) / (4 + 2 + kMaxKeySize);
-constexpr uint32_t kInternalMinKeys = kInternalMaxKeys / 2;
+// Nodes are sized in bytes, not entries: a node is full when its serialized
+// body exceeds kNodeCapacity and underfull (if it is not the root) when it
+// uses fewer than kNodeMinFill bytes. Small entries pack hundreds to a page.
+constexpr uint32_t kNodeCapacity = kPageSize - kPageHeaderSize;
+constexpr uint32_t kNodeMinFill = kNodeCapacity / 4;
 
-static_assert(kLeafMaxKeys >= 4, "page too small for leaf fan-out");
-static_assert(kInternalMaxKeys >= 4, "page too small for internal fan-out");
+// Values longer than this are stored in a chain of overflow pages; the leaf
+// keeps only a fixed-size reference to the chain.
+constexpr uint32_t kMaxInlineValue = 512;
+constexpr uint32_t kOverflowPayload = kPageSize - kPageHeaderSize;
+
+// Worst-case entry sizes. Keeping each at most half a page guarantees that
+// splitting or redistributing always yields two nodes that fit and are at
+// least kNodeMinFill bytes.
+constexpr uint32_t kMaxLeafEntry = 2 + kMaxKeySize + 1 + 2 + kMaxInlineValue;
+constexpr uint32_t kMaxInternalEntry = 2 + kMaxKeySize + 4;
+static_assert(kMaxLeafEntry <= kNodeCapacity / 2, "leaf entries too large for the page size");
+static_assert(kMaxInternalEntry <= kNodeCapacity / 2, "keys too large for the page size");
 
 // Deserialized view of one tree page.
-//   Leaf:     keys[i] -> values[i], `next` links to the right sibling leaf.
+//   Leaf:     keys[i] -> cells[i], `next` links to the right sibling leaf.
+//             A cell is the encoded value: [0][vlen u16][bytes] inline, or
+//             [1][vlen u32][first overflow page u32] for large values.
 //   Internal: children.size() == keys.size() + 1. Subtree children[i] holds
 //             keys in [keys[i-1], keys[i]).
 struct Node {
@@ -28,7 +39,7 @@ struct Node {
   bool leaf = true;
   PageId next = kInvalidPage;
   std::vector<std::string> keys;
-  std::vector<std::string> values;
+  std::vector<std::string> cells;
   std::vector<PageId> children;
 };
 
@@ -56,26 +67,31 @@ class BTree {
   std::string check();
 
  private:
-  struct Split {
-    bool happened = false;
-    std::string separator;
-    PageId right = kInvalidPage;
+  // One put (value != nullptr) or delete travelling down the tree.
+  struct Mutation {
+    const std::string* key;
+    const std::string* value;
+    bool inserted = false;
+    bool removed = false;
   };
 
   Node load(PageId id);
   void store(const Node& n);
 
-  static bool underflows(const Node& n);
-  static bool canLend(const Node& n);
-
-  Split insertInto(PageId id, const std::string& key, const std::string& value, bool* inserted);
-  bool removeFrom(PageId id, const std::string& key);
+  void apply(Mutation& m);
+  bool modify(PageId id, Mutation& m, Node* out);
+  void fixChild(Node& parent, size_t idx, Node& child);
+  void splitNode(Node& n, Node& right, std::string* separator);
   void rebalance(Node& parent, size_t idx, Node& child);
-  void merge(Node& parent, size_t left_idx, Node& left, Node& right);
+
+  std::string makeCell(const std::string& value);
+  void readCell(const std::string& cell, std::string* value);
+  void freeCell(const std::string& cell);
 
   struct CheckState;
   void checkNode(PageId id, const std::string* lo, const std::string* hi, uint32_t depth, bool is_root,
                  CheckState& st);
+  void checkCell(PageId leaf, const std::string& cell, CheckState& st);
 
   Pager& pager_;
 };

@@ -30,13 +30,13 @@ DB::DB(const std::string& dir, const Options& options)
   bool fresh = pager_.isNew();
   if (fresh) tree_.init();
 
-  // 2. Redo every logged operation the data file has not seen yet.
+  // 2. Redo every logged batch the data file has not seen yet.
   wal_.open();
   Lsn checkpointed = pager_.meta().checkpoint_lsn;
   last_lsn_ = checkpointed;
-  Lsn wal_last = wal_.replay([&](const WalRecord& rec) {
-    if (rec.lsn <= checkpointed) return;  // already in the data file
-    apply(rec);
+  Lsn wal_last = wal_.replay([&](Lsn lsn, const WriteBatch& batch) {
+    if (lsn <= checkpointed) return;  // already in the data file
+    applyBatch(batch);
     replayed_++;
   });
   last_lsn_ = std::max(last_lsn_, wal_last);
@@ -46,7 +46,7 @@ DB::DB(const std::string& dir, const Options& options)
 }
 
 DB::~DB() {
-  if (abandoned_) return;
+  if (abandoned_ || failed_) return;  // never checkpoint a possibly half-applied tree
   try {
     checkpoint();
   } catch (...) {
@@ -62,59 +62,85 @@ void DB::validate(const std::string& key, const std::string* value) {
   }
 }
 
-void DB::apply(const WalRecord& rec) {
-  if (rec.op == WalOp::Put) {
-    tree_.put(rec.key, rec.value);
-  } else {
-    tree_.remove(rec.key);
+void DB::ensureUsable() const {
+  if (failed_) throw Error("database is in a failed state after an earlier error; reopen it to recover");
+}
+
+void DB::applyBatch(const WriteBatch& batch) {
+  for (const WriteBatch::Entry& e : batch.entries()) {
+    if (e.op == WalOp::Put) {
+      tree_.put(e.key, e.value);
+    } else {
+      tree_.remove(e.key);
+    }
+  }
+}
+
+// Logs the batch, then applies it. Any failure after the log write leaves
+// the tree in an unknown state, so the DB is marked failed; the batch itself
+// is safe in the WAL and is replayed on the next open.
+void DB::commit(const WriteBatch& batch) {
+  ensureUsable();
+  try {
+    Lsn lsn = last_lsn_ + 1;
+    wal_.append(lsn, batch, options_.sync_writes);  // durable from here on
+    last_lsn_ = lsn;
+    failpoint::crashIfHit("db.after_wal");
+    applyBatch(batch);
+    maybeCheckpoint();
+  } catch (...) {
+    failed_ = true;
+    throw;
   }
 }
 
 void DB::put(const std::string& key, const std::string& value) {
   validate(key, &value);
-  WalRecord rec;
-  rec.lsn = last_lsn_ + 1;
-  rec.op = WalOp::Put;
-  rec.key = key;
-  rec.value = value;
-
-  wal_.append(rec, options_.sync_writes);  // durable from here on
-  last_lsn_ = rec.lsn;
-  failpoint::crashIfHit("db.after_wal");
-  apply(rec);
-  maybeCheckpoint();
-}
-
-bool DB::get(const std::string& key, std::string* value) {
-  validate(key, nullptr);
-  return tree_.get(key, value);
+  WriteBatch batch;
+  batch.put(key, value);
+  commit(batch);
 }
 
 bool DB::remove(const std::string& key) {
   validate(key, nullptr);
+  ensureUsable();
   if (!tree_.get(key, nullptr)) return false;  // nothing to log
-
-  WalRecord rec;
-  rec.lsn = last_lsn_ + 1;
-  rec.op = WalOp::Delete;
-  rec.key = key;
-
-  wal_.append(rec, options_.sync_writes);
-  last_lsn_ = rec.lsn;
-  failpoint::crashIfHit("db.after_wal");
-  apply(rec);
-  maybeCheckpoint();
+  WriteBatch batch;
+  batch.remove(key);
+  commit(batch);
   return true;
 }
 
+void DB::write(const WriteBatch& batch) {
+  for (const WriteBatch::Entry& e : batch.entries()) {
+    validate(e.key, e.op == WalOp::Put ? &e.value : nullptr);
+  }
+  if (batch.byteSize() > kMaxBatchBytes) throw Error("batch larger than the 64 MiB limit");
+  if (batch.empty()) return;
+  commit(batch);
+}
+
+bool DB::get(const std::string& key, std::string* value) {
+  validate(key, nullptr);
+  ensureUsable();
+  return tree_.get(key, value);
+}
+
 void DB::scan(const std::string& lo, const std::string& hi, const ScanFn& fn) {
+  ensureUsable();
   tree_.scan(lo, hi.empty() ? nullptr : &hi, fn);
 }
 
 void DB::checkpoint() {
-  pager_.checkpoint(last_lsn_);
-  failpoint::crashIfHit("ckpt.before_wal_reset");
-  wal_.reset();
+  ensureUsable();
+  try {
+    pager_.checkpoint(last_lsn_);
+    failpoint::crashIfHit("ckpt.before_wal_reset");
+    wal_.reset();
+  } catch (...) {
+    failed_ = true;
+    throw;
+  }
 }
 
 void DB::maybeCheckpoint() {
@@ -123,7 +149,13 @@ void DB::maybeCheckpoint() {
   }
 }
 
+std::string DB::checkIntegrity() {
+  ensureUsable();
+  return tree_.check();
+}
+
 DBStats DB::stats() {
+  ensureUsable();
   DBStats s;
   const PagerStats& ps = pager_.stats();
   s.keys = pager_.meta().key_count;

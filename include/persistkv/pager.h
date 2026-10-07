@@ -10,13 +10,13 @@
 
 namespace pkv {
 
-enum class PageType : uint8_t { Meta = 1, Leaf = 2, Internal = 3, Free = 4 };
+enum class PageType : uint8_t { Meta = 1, Leaf = 2, Internal = 3, Free = 4, Overflow = 5 };
 
 // Every page starts with a 16-byte header:
 //   [0, 4)   CRC32 of bytes [4, kPageSize)
 //   [4]      PageType
-//   [6, 8)   number of keys (tree pages)
-//   [8, 12)  next page id (leaf right-sibling, or free-list link)
+//   [6, 8)   number of keys (tree pages) / bytes used (overflow pages)
+//   [8, 12)  next page id (leaf right-sibling, overflow chain, or free-list link)
 constexpr uint32_t kPageHeaderSize = 16;
 constexpr uint32_t kOffType = 4;
 constexpr uint32_t kOffNumKeys = 6;

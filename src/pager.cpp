@@ -10,7 +10,7 @@ namespace pkv {
 namespace {
 
 constexpr uint64_t kMetaMagic = 0x31304244564B5650ull;  // "PKVDB01"
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kFormatVersion = 2;  // 2: variable-size nodes, overflow pages
 
 // Meta page body layout (after the common header).
 constexpr uint32_t kOffMagic = 16;

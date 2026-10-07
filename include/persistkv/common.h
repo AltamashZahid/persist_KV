@@ -12,8 +12,8 @@ using PageId = uint32_t;
 using Lsn = uint64_t;
 
 constexpr uint32_t kPageSize = 4096;
-constexpr uint32_t kMaxKeySize = 32;
-constexpr uint32_t kMaxValueSize = 200;
+constexpr uint32_t kMaxKeySize = 128;
+constexpr uint32_t kMaxValueSize = 1u << 20;  // 1 MiB; large values live in overflow pages
 
 // Page 0 is always the meta page, so 0 can never be a tree node or free page.
 constexpr PageId kInvalidPage = 0;

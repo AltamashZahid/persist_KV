@@ -6,6 +6,7 @@
 #include "persistkv/common.h"
 #include "persistkv/pager.h"
 #include "persistkv/wal.h"
+#include "persistkv/write_batch.h"
 
 namespace pkv {
 
@@ -36,12 +37,17 @@ struct DBStats {
   bool recovered_from_doublewrite = false;
 };
 
-// A crash-safe, single-threaded key-value store.
+// A crash-safe key-value store.
 //
 // Write path: append to the WAL (fsync) -> apply to the B+Tree in the page
 // cache -> occasionally checkpoint dirty pages to the data file.
 // Open path: repair from the doublewrite buffer -> load meta -> replay WAL
 // records newer than the last checkpoint.
+//
+// If an operation fails midway (an I/O error, or corruption found while
+// applying a change), the in-memory tree may be half-modified. The DB then
+// enters a failed state: every later call throws, and nothing more is
+// written to the data file. Reopening recovers from the WAL.
 class DB {
  public:
   static constexpr const char* kDataFile = "data.db";
@@ -58,13 +64,16 @@ class DB {
   bool get(const std::string& key, std::string* value);
   bool remove(const std::string& key);
 
+  // Applies every operation in the batch atomically, with one fsync.
+  void write(const WriteBatch& batch);
+
   // Visits keys in [lo, hi] in order; an empty `hi` means no upper bound.
   // Stop early by returning false from fn.
   void scan(const std::string& lo, const std::string& hi, const ScanFn& fn);
 
   void checkpoint();
   uint64_t size() const { return pager_.meta().key_count; }
-  std::string checkIntegrity() { return tree_.check(); }
+  std::string checkIntegrity();
   DBStats stats();
 
   // Testing hook: makes the destructor skip its checkpoint, so the files are
@@ -76,7 +85,9 @@ class DB {
 
  private:
   static void validate(const std::string& key, const std::string* value);
-  void apply(const WalRecord& rec);
+  void ensureUsable() const;
+  void commit(const WriteBatch& batch);
+  void applyBatch(const WriteBatch& batch);
   void maybeCheckpoint();
 
   std::string dir_;
@@ -87,6 +98,7 @@ class DB {
   Lsn last_lsn_ = 0;
   uint64_t replayed_ = 0;
   bool abandoned_ = false;
+  bool failed_ = false;
 };
 
 }  // namespace pkv

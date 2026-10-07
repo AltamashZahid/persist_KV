@@ -83,6 +83,14 @@ int main(int argc, char** argv) {
     timeIt("durable put (fsync every write)", m, [&] {
       for (int i = 0; i < m; i++) db.put(key(n + i), value);
     });
+    const int batches = 200, per_batch = 100;
+    timeIt("durable put, WriteBatch of 100", batches * per_batch, [&] {
+      for (int b = 0; b < batches; b++) {
+        WriteBatch batch;
+        for (int i = 0; i < per_batch; i++) batch.put(key(n + m + b * per_batch + i), value);
+        db.write(batch);
+      }
+    });
   }
   return 0;
 }

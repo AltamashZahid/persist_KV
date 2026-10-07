@@ -289,6 +289,178 @@ TEST(corrupted_page_is_detected) {
   CHECK_THROWS(dump(db), CorruptionError);
 }
 
+TEST(large_values_use_overflow_pages) {
+  std::string dir = freshDir("overflow");
+  // Sizes around every boundary: inline limit, one overflow page, several.
+  const size_t sizes[] = {0, 1, kMaxInlineValue, kMaxInlineValue + 1, kOverflowPayload, kOverflowPayload + 1,
+                          3 * kOverflowPayload, 100000, kMaxValueSize};
+  auto valueOf = [](size_t n, char seed) {
+    std::string v(n, 'a');
+    for (size_t i = 0; i < n; i++) v[i] = static_cast<char>(seed + i * 31 % 251);
+    return v;
+  };
+  {
+    DB db(dir, fastOptions());
+    int i = 0;
+    for (size_t n : sizes) db.put("big" + std::to_string(i++), valueOf(n, 'x'));
+    CHECK_HEALTHY(db);
+    uint32_t pages_with_values = db.stats().pages;
+    CHECK(pages_with_values > kMaxValueSize / kPageSize);  // the 1 MiB value really is out of line
+
+    // Overwrite large -> small -> large; chains must be freed and reused.
+    for (int round = 0; round < 3; round++) {
+      db.put("big8", "tiny");
+      CHECK_HEALTHY(db);
+      db.put("big8", valueOf(kMaxValueSize, 'y'));
+      CHECK_HEALTHY(db);
+    }
+    CHECK(db.stats().pages <= pages_with_values + 1);
+  }
+  DB db(dir, fastOptions());  // and everything survives a reopen
+  int i = 0;
+  for (size_t n : sizes) {
+    std::string v;
+    CHECK(db.get("big" + std::to_string(i), &v));
+    CHECK(v == (i == 8 ? valueOf(kMaxValueSize, 'y') : valueOf(n, 'x')));
+    i++;
+  }
+  for (int j = 0; j < i; j++) CHECK(db.remove("big" + std::to_string(j)));
+  CHECK_HEALTHY(db);  // includes the check that no overflow page leaked
+}
+
+TEST(variable_size_keys_and_values_match_std_map) {
+  Options o = fastOptions();
+  o.cache_pages = 64;
+  o.checkpoint_dirty_pages = 128;
+  DB db(freshDir("variable_sizes"), o);
+  std::map<std::string, std::string> model;
+  std::mt19937 rng(4242);
+  auto randomKey = [&] {
+    // Few distinct prefixes so keys collide often; lengths 1..kMaxKeySize.
+    std::string k = std::to_string(rng() % 3000);
+    k.resize(1 + rng() % kMaxKeySize, static_cast<char>('a' + k.size() % 26));
+    return k;
+  };
+
+  // Phase 1 grows the tree (2 puts per delete); phase 2 shrinks it (3
+  // deletes per put), which drives merges and redistribution between
+  // siblings whose keys have very different lengths.
+  for (int phase = 0; phase < 2; phase++) {
+    for (int i = 0; i < 25000; i++) {
+      bool del = phase == 0 ? rng() % 3 == 0 : rng() % 4 != 0;
+      if (del && !model.empty()) {
+        // Delete an existing key most of the time so the tree really shrinks.
+        auto it = model.lower_bound(randomKey());
+        if (it == model.end()) it = model.begin();
+        std::string k = it->first;
+        CHECK(db.remove(k));
+        model.erase(it);
+      } else {
+        // Mostly small values, some just past the inline limit, a few big.
+        std::string k = randomKey();
+        size_t len = rng() % 10 == 0 ? rng() % 3000 : rng() % 64;
+        std::string v(len, static_cast<char>('A' + i % 26));
+        db.put(k, v);
+        model[k] = v;
+      }
+      if (i % 2500 == 0) CHECK_HEALTHY(db);
+    }
+    CHECK_HEALTHY(db);
+    CHECK(db.size() == model.size());
+    CHECK(dump(db) == model);
+  }
+
+  // Finally delete everything in random order.
+  std::vector<std::string> rest;
+  for (auto& kv : model) rest.push_back(kv.first);
+  std::shuffle(rest.begin(), rest.end(), rng);
+  for (size_t i = 0; i < rest.size(); i++) {
+    CHECK(db.remove(rest[i]));
+    if (i % 500 == 0) CHECK_HEALTHY(db);
+  }
+  CHECK_HEALTHY(db);
+  CHECK(db.size() == 0 && db.stats().height == 1);
+}
+
+TEST(small_entries_pack_densely) {
+  DB db(freshDir("dense"), fastOptions());
+  const int n = 20000;
+  for (int i = 0; i < n; i++) db.put(key(i), "v" + std::to_string(i));
+  CHECK_HEALTHY(db);
+  // ~25 bytes per entry: well over 100 entries per 4 KB leaf, so 20000
+  // entries need a couple of hundred pages, not thousands.
+  CHECK(db.stats().pages < 400);
+}
+
+TEST(write_batch_applies_atomically) {
+  std::string dir = freshDir("batch");
+  {
+    DB db(dir, fastOptions());
+    db.put("before", "1");
+    WriteBatch batch;
+    for (int i = 0; i < 100; i++) batch.put(key(i), value(i));
+    batch.remove("before");
+    db.write(batch);
+    CHECK(db.size() == 100);
+    CHECK(!db.get("before", nullptr));
+    db.abandonForTesting();
+  }
+  DB db(dir, fastOptions());  // the batch is replayed as one unit
+  CHECK(db.size() == 100);
+  CHECK_HEALTHY(db);
+}
+
+TEST(torn_write_batch_is_discarded_entirely) {
+  std::string dir = freshDir("torn_batch");
+  uint64_t wal_size;
+  {
+    DB db(dir, fastOptions());
+    db.put("before", "1");
+    WriteBatch batch;
+    for (int i = 0; i < 100; i++) batch.put(key(i), value(i));
+    db.write(batch);
+    wal_size = db.stats().wal_bytes;
+    db.abandonForTesting();
+  }
+  {
+    // Cut the last record (the batch) short, as a crash mid-append would.
+    File wal;
+    wal.open(dir + "/" + DB::kWalFile);
+    wal.truncate(wal_size - 10);
+  }
+  DB db(dir, fastOptions());
+  CHECK(db.size() == 1);  // "before" survives, none of the 100 batch puts do
+  CHECK(db.get("before", nullptr));
+  CHECK(!db.get(key(0), nullptr));
+  CHECK_HEALTHY(db);
+}
+
+TEST(error_during_write_puts_db_in_failed_state) {
+  std::string dir = freshDir("failed_state");
+  Options o = fastOptions();
+  o.cache_pages = 16;  // so the corrupted page has to be read from disk
+  {
+    DB db(dir, o);
+    for (int i = 0; i < 3000; i++) db.put(key(i), value(i));
+  }
+  {
+    File data;
+    data.open(dir + "/" + DB::kDataFile);
+    char c;
+    data.readAt(kPageSize + 100, &c, 1);  // page 1 is the leftmost leaf
+    c ^= 0x5A;
+    data.writeAt(kPageSize + 100, &c, 1);
+  }
+  {
+    DB db(dir, o);
+    CHECK_THROWS(db.put(key(0), "new"), CorruptionError);  // logged, then failed to apply
+    CHECK_THROWS(db.get(key(1), nullptr), Error);          // every later call is refused
+  }
+  // The data file was never checkpointed in the failed state; the put is
+  // still in the WAL, and replaying it hits the same corrupt page.
+  CHECK_THROWS(DB(dir, o), CorruptionError);
+}
+
 int main(int argc, char** argv) {
   std::string filter = argc > 1 ? argv[1] : "";
   int passed = 0, failed = 0;

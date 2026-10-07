@@ -5,34 +5,34 @@
 
 #include "persistkv/common.h"
 #include "persistkv/file.h"
+#include "persistkv/write_batch.h"
 
 namespace pkv {
 
-enum class WalOp : uint8_t { Put = 1, Delete = 2 };
+// Largest batch (sum of key and value bytes) one WAL record may carry.
+constexpr uint64_t kMaxBatchBytes = 64ull << 20;
 
-struct WalRecord {
-  Lsn lsn = 0;
-  WalOp op = WalOp::Put;
-  std::string key;
-  std::string value;
-};
-
-// Append-only redo log. On-disk record layout:
-//   [crc32 u32][len u32][lsn u64][op u8][klen u16][vlen u16][key][value]
+// Append-only redo log. Each record holds one atomic batch:
+//   [crc32 u32][len u32][lsn u64][count u32]
+//   then `count` times: [op u8][klen u16][vlen u32][key][value]
 // where len counts the bytes after the len field and the CRC covers
-// everything after the CRC field. Records are logical (put/delete), so
-// replaying them on top of the last checkpoint is idempotent.
+// everything after the CRC field. A record is applied entirely or (if torn)
+// not at all, which is what makes a WriteBatch atomic. Operations are
+// logical (put/delete), so replaying them on top of the last checkpoint is
+// idempotent.
 class Wal {
  public:
+  using ReplayFn = std::function<void(Lsn lsn, const WriteBatch& batch)>;
+
   explicit Wal(std::string path) : path_(std::move(path)) {}
 
   void open();
 
   // Calls fn for every intact record in order. Stops at the first torn or
   // corrupt record and truncates the file there. Returns the last LSN seen.
-  Lsn replay(const std::function<void(const WalRecord&)>& fn);
+  Lsn replay(const ReplayFn& fn);
 
-  void append(const WalRecord& rec, bool sync);
+  void append(Lsn lsn, const WriteBatch& batch, bool sync);
   void reset();  // empty the log after a checkpoint
 
   uint64_t size() const { return size_; }
