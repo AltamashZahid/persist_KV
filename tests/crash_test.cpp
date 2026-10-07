@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
   std::string mode = argc > 1 ? argv[1] : "";
 
   if (mode == "child" && argc == 6) {
-    return runWorkload(argv[2], argv[3], std::atol(argv[4]), static_cast<unsigned>(std::atol(argv[5])));
+    return runWorkload(argv[2], argv[3], std::atol(argv[4]), static_cast<unsigned>(std::strtoul(argv[5], nullptr, 10)));
   }
   if (mode == "recover" && argc == 4) return runRecovery(argv[2], std::atol(argv[3]));
 
@@ -260,7 +260,7 @@ int main(int argc, char** argv) {
   }
   if (mode == "fuzz") {
     int n = argc > 2 ? std::atoi(argv[2]) : 200;
-    unsigned seed = argc > 3 ? static_cast<unsigned>(std::atol(argv[3])) : 1;
+    unsigned seed = argc > 3 ? static_cast<unsigned>(std::strtoul(argv[3], nullptr, 10)) : 1;
     return runFuzz(n, seed) == 0 ? 0 : 1;
   }
 
