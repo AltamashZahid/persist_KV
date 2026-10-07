@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <string>
 
@@ -33,6 +34,7 @@ class Wal {
   Lsn replay(const ReplayFn& fn);
 
   void append(Lsn lsn, const WriteBatch& batch, bool sync);
+  void sync();   // make every appended record durable
   void reset();  // empty the log after a checkpoint
 
   uint64_t size() const { return size_; }
@@ -41,7 +43,9 @@ class Wal {
  private:
   std::string path_;
   File file_;
-  uint64_t size_ = 0;
+  // Atomic because a checkpoint resets the retired log without the DB's WAL
+  // lock while stats() may be reading its size.
+  std::atomic<uint64_t> size_{0};
   uint64_t truncated_bytes_ = 0;
 };
 

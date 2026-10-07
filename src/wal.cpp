@@ -107,6 +107,8 @@ void Wal::append(Lsn lsn, const WriteBatch& batch, bool sync) {
   if (sync) file_.sync();
 }
 
+void Wal::sync() { file_.sync(); }
+
 void Wal::reset() {
   file_.truncate(0);
   file_.sync();

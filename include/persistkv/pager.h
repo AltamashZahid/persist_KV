@@ -7,6 +7,7 @@
 
 #include "persistkv/common.h"
 #include "persistkv/file.h"
+#include "persistkv/sync.h"
 
 namespace pkv {
 
@@ -42,9 +43,23 @@ struct PagerStats {
   bool recovered_from_doublewrite = false;
 };
 
+// A consistent copy of every dirty page plus the meta page, taken at one
+// instant. Writing it out can then proceed while the tree keeps changing.
+struct CheckpointSnapshot {
+  Lsn lsn = 0;
+  std::vector<char> meta_page;
+  std::vector<PageId> ids;          // sorted
+  std::vector<std::vector<char>> pages;  // pages[i] is the content of ids[i]
+};
+
 // Owns the data file and the doublewrite buffer. Caches pages with LRU
-// eviction; dirty pages stay pinned in memory until the next checkpoint, so
-// the data file only ever changes inside checkpoint().
+// eviction; dirty pages stay in memory until the next checkpoint, so the data
+// file only ever changes inside a checkpoint.
+//
+// Thread safety: the page cache is guarded by an internal mutex, so read()
+// may be called from many threads at once. Calls that change the tree
+// (write, allocate, free, meta()) must be serialized by the caller; the DB
+// does so with its tree lock.
 class Pager {
  public:
   Pager(std::string data_path, std::string dwb_path, size_t cache_pages);
@@ -62,28 +77,40 @@ class Pager {
 
   Meta& meta() { return meta_; }
   const Meta& meta() const { return meta_; }
-  size_t dirtyCount() const { return dirty_count_; }
-  size_t cachedCount() const { return frames_.size(); }
-  const PagerStats& stats() const { return stats_; }
+  size_t dirtyCount();
+  size_t cachedCount();
+  PagerStats stats();
 
-  // Atomically makes the data file reflect everything up to `lsn`:
+  // A checkpoint makes the data file reflect everything up to `lsn`:
   //   1. write all dirty pages + meta to the doublewrite file, fsync
   //   2. write them in place in the data file, fsync
   //   3. truncate the doublewrite file
   // A crash during (1) leaves the data file untouched; a crash during (2)
   // is repaired on the next open() by replaying the doublewrite file.
-  void checkpoint(Lsn lsn);
+  //
+  // It runs in three calls so the slow part needs no tree lock:
+  //   beginCheckpoint  (tree must not be changing) copies the dirty pages,
+  //                    marks them clean, and pins them in the cache;
+  //   writeCheckpoint  (any time) performs steps 1-3;
+  //   endCheckpoint    unpins the pages.
+  // Pinning matters: until the data file holds a flushed page, evicting it
+  // and reading it back from disk would return stale bytes.
+  CheckpointSnapshot beginCheckpoint(Lsn lsn);
+  void writeCheckpoint(const CheckpointSnapshot& snap);
+  void endCheckpoint(const CheckpointSnapshot& snap);
+  void checkpoint(Lsn lsn);  // all three, for single-threaded callers
 
  private:
   struct Frame {
     std::vector<char> data;
     bool dirty = false;
+    int pins = 0;  // > 0 while a checkpoint is writing this page out
     std::list<PageId>::iterator lru;
   };
 
-  Frame& frame(PageId id, bool load_from_disk);
+  Frame& frame(PageId id, bool load_from_disk);  // cache_mu_ must be held
   void loadFromDisk(PageId id, char* out);
-  void evictIfNeeded(PageId keep);
+  void evictIfNeeded(PageId keep);  // cache_mu_ must be held
   void recoverDoublewrite();
   void encodeMeta(char* page) const;
   void decodeMeta(const char* page);
@@ -95,6 +122,8 @@ class Pager {
   size_t capacity_;
   bool is_new_ = false;
   Meta meta_;
+
+  Mutex cache_mu_;  // guards everything below
   std::unordered_map<PageId, Frame> frames_;
   std::list<PageId> lru_;  // front = most recently used
   size_t dirty_count_ = 0;

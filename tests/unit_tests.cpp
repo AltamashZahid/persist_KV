@@ -1,6 +1,8 @@
 // Unit tests for PersistKV. Each test gets its own directory under test_data/.
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -11,6 +13,7 @@
 #include "persistkv/crc32.h"
 #include "persistkv/db.h"
 #include "persistkv/file.h"
+#include "persistkv/sync.h"
 
 using namespace pkv;
 
@@ -459,6 +462,109 @@ TEST(error_during_write_puts_db_in_failed_state) {
   // The data file was never checkpointed in the failed state; the put is
   // still in the WAL, and replaying it hits the same corrupt page.
   CHECK_THROWS(DB(dir, o), CorruptionError);
+}
+
+TEST(concurrent_readers_writers_and_background_checkpoints) {
+  std::string dir = freshDir("concurrent");
+  Options o = fastOptions();
+  o.cache_pages = 64;
+  o.checkpoint_dirty_pages = 48;  // checkpoint constantly, concurrently with everything else
+  o.checkpoint_wal_bytes = 64 * 1024;
+
+  const int kWriters = 4, kReaders = 4, kOpsPerWriter = 3000, kKeysPerWriter = 400;
+  std::vector<std::map<std::string, std::string>> models(kWriters);
+  std::atomic<bool> writers_done(false);
+  std::atomic<int> errors(0);
+  std::atomic<long> reads(0);
+  auto writerKey = [](int w, unsigned i) { return "w" + std::to_string(w) + "-" + std::to_string(i % 400); };
+
+  {
+    DB db(dir, o);
+    std::vector<std::unique_ptr<Thread>> threads;
+    for (int w = 0; w < kWriters; w++) {
+      threads.emplace_back(new Thread());
+      threads.back()->start([&, w] {
+        std::mt19937 rng(w);
+        auto& model = models[w];
+        for (int i = 0; i < kOpsPerWriter; i++) {
+          std::string k = writerKey(w, rng() % kKeysPerWriter);
+          if (rng() % 4 == 0) {
+            db.remove(k);
+            model.erase(k);
+          } else {
+            // Every value starts with its own key, so readers can detect a
+            // torn or mismatched read. Some are large enough to overflow.
+            std::string v = k + "#" + std::to_string(i) + std::string(rng() % 8 == 0 ? 700 + rng() % 3000 : rng() % 50, '.');
+            db.put(k, v);
+            model[k] = v;
+          }
+        }
+      });
+    }
+    for (int r = 0; r < kReaders; r++) {
+      threads.emplace_back(new Thread());
+      threads.back()->start([&, r] {
+        std::mt19937 rng(100 + r);
+        std::string v;
+        while (!writers_done) {
+          std::string k = writerKey(rng() % kWriters, rng() % kKeysPerWriter);
+          if (db.get(k, &v) && v.compare(0, k.size() + 1, k + "#") != 0) errors++;
+          if (rng() % 50 == 0) {
+            std::string prev;
+            db.scan(k, "", [&](const std::string& sk, const std::string& sv) {
+              if (!prev.empty() && !(prev < sk)) errors++;
+              if (sv.compare(0, sk.size() + 1, sk + "#") != 0) errors++;
+              prev = sk;
+              return prev.size() < 1000 && rng() % 64 != 0;
+            });
+          }
+          reads++;
+        }
+      });
+    }
+    for (int w = 0; w < kWriters; w++) threads[w]->join();
+    writers_done = true;
+    for (auto& t : threads) t->join();
+
+    CHECK(errors == 0);
+    CHECK(reads > 0);
+    CHECK_HEALTHY(db);
+    CHECK(db.stats().checkpoints > 1);
+    std::map<std::string, std::string> all;
+    for (auto& m : models) all.insert(m.begin(), m.end());
+    CHECK(dump(db) == all);
+    db.abandonForTesting();  // and recovery must reproduce exactly this state
+  }
+  DB db(dir, o);
+  std::map<std::string, std::string> all;
+  for (auto& m : models) all.insert(m.begin(), m.end());
+  CHECK(dump(db) == all);
+  CHECK_HEALTHY(db);
+}
+
+TEST(group_commit_shares_fsyncs_between_threads) {
+  std::string dir = freshDir("group_commit");
+  Options o;  // durable: every commit is fsynced
+  const int kThreads = 8, kPerThread = 150;
+  {
+    DB db(dir, o);
+    std::vector<std::unique_ptr<Thread>> threads;
+    for (int t = 0; t < kThreads; t++) {
+      threads.emplace_back(new Thread());
+      threads.back()->start([&, t] {
+        for (int i = 0; i < kPerThread; i++) db.put(key(t * kPerThread + i), value(i));
+      });
+    }
+    for (auto& t : threads) t->join();
+    DBStats s = db.stats();
+    CHECK(s.commit_batches == kThreads * kPerThread);
+    CHECK(s.commit_groups < s.commit_batches);  // several commits shared one fsync
+    std::printf("         (%s commits in %s fsyncs)\n", std::to_string(s.commit_batches).c_str(),
+                std::to_string(s.commit_groups).c_str());
+  }
+  DB db(dir, o);
+  CHECK(db.size() == kThreads * kPerThread);
+  CHECK_HEALTHY(db);
 }
 
 int main(int argc, char** argv) {

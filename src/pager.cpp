@@ -141,15 +141,15 @@ Pager::Frame& Pager::frame(PageId id, bool load_from_disk) {
 }
 
 void Pager::evictIfNeeded(PageId keep) {
-  // Walk from the cold end and drop clean pages. Dirty pages cannot be
-  // evicted (the data file may only change during a checkpoint), so the
-  // cache can temporarily grow past capacity until the next checkpoint.
+  // Walk from the cold end and drop clean, unpinned pages. Dirty pages
+  // cannot be evicted (the data file may only change during a checkpoint),
+  // so the cache can temporarily grow past capacity until the next one.
   auto it = lru_.end();
   while (frames_.size() > capacity_ && it != lru_.begin()) {
     --it;
     if (*it == keep) continue;
     auto f = frames_.find(*it);
-    if (f->second.dirty) continue;
+    if (f->second.dirty || f->second.pins > 0) continue;
     frames_.erase(f);
     it = lru_.erase(it);
   }
@@ -159,6 +159,7 @@ void Pager::read(PageId id, char* out) {
   if (id == kInvalidPage || id >= meta_.page_count) {
     throw CorruptionError("read of out-of-range page " + std::to_string(id));
   }
+  LockGuard lock(cache_mu_);
   std::memcpy(out, frame(id, true).data.data(), kPageSize);
 }
 
@@ -166,6 +167,7 @@ void Pager::write(PageId id, const char* in) {
   if (id == kInvalidPage || id >= meta_.page_count) {
     throw Error("write of out-of-range page " + std::to_string(id));
   }
+  LockGuard lock(cache_mu_);
   Frame& f = frame(id, false);
   std::memcpy(f.data.data(), in, kPageSize);
   if (!f.dirty) {
@@ -194,23 +196,49 @@ void Pager::free(PageId id) {
   meta_.free_head = id;
 }
 
-void Pager::checkpoint(Lsn lsn) {
+size_t Pager::dirtyCount() {
+  LockGuard lock(cache_mu_);
+  return dirty_count_;
+}
+
+size_t Pager::cachedCount() {
+  LockGuard lock(cache_mu_);
+  return frames_.size();
+}
+
+PagerStats Pager::stats() {
+  LockGuard lock(cache_mu_);
+  return stats_;
+}
+
+CheckpointSnapshot Pager::beginCheckpoint(Lsn lsn) {
+  CheckpointSnapshot snap;
+  snap.lsn = lsn;
   meta_.checkpoint_lsn = lsn;
-  std::vector<char> meta_page(kPageSize);
-  encodeMeta(meta_page.data());
+  snap.meta_page.resize(kPageSize);
+  encodeMeta(snap.meta_page.data());
 
-  std::vector<PageId> dirty;
+  LockGuard lock(cache_mu_);
   for (auto& kv : frames_) {
-    if (kv.second.dirty) {
-      stampChecksum(kv.second.data.data());
-      dirty.push_back(kv.first);
-    }
+    if (kv.second.dirty) snap.ids.push_back(kv.first);
   }
-  std::sort(dirty.begin(), dirty.end());
+  std::sort(snap.ids.begin(), snap.ids.end());
+  snap.pages.reserve(snap.ids.size());
+  for (PageId id : snap.ids) {
+    Frame& f = frames_[id];
+    stampChecksum(f.data.data());
+    snap.pages.push_back(f.data);
+    f.dirty = false;  // a later write re-dirties it for the next checkpoint
+    f.pins++;
+  }
+  dirty_count_ = 0;
+  return snap;
+}
 
+void Pager::writeCheckpoint(const CheckpointSnapshot& snap) {
   // 1. Doublewrite buffer: a complete, checksummed copy of every page we
   //    are about to overwrite.
-  uint32_t count = static_cast<uint32_t>(dirty.size() + 1);
+  uint32_t count = static_cast<uint32_t>(snap.ids.size() + 1);
   std::vector<char> dwb(kDwbHeaderSize + static_cast<size_t>(count) * kDwbEntrySize);
   size_t off = kDwbHeaderSize;
   auto append = [&](PageId id, const char* page) {
@@ -218,8 +246,8 @@ void Pager::checkpoint(Lsn lsn) {
     std::memcpy(&dwb[off + 4], page, kPageSize);
     off += kDwbEntrySize;
   };
-  append(0, meta_page.data());
-  for (PageId id : dirty) append(id, frames_[id].data.data());
+  append(0, snap.meta_page.data());
+  for (size_t i = 0; i < snap.ids.size(); i++) append(snap.ids[i], snap.pages[i].data());
   put32(&dwb[0], kDwbMagic);
   put32(&dwb[4], count);
   put32(&dwb[8], crc32(&dwb[kDwbHeaderSize], dwb.size() - kDwbHeaderSize));
@@ -237,8 +265,8 @@ void Pager::checkpoint(Lsn lsn) {
     }
     data_.writeAt(pos, page, kPageSize);
   };
-  writeInPlace(0, meta_page.data());
-  for (PageId id : dirty) writeInPlace(id, frames_[id].data.data());
+  writeInPlace(0, snap.meta_page.data());
+  for (size_t i = 0; i < snap.ids.size(); i++) writeInPlace(snap.ids[i], snap.pages[i].data());
   data_.sync();
   failpoint::crashIfHit("ckpt.after_data");
 
@@ -246,12 +274,25 @@ void Pager::checkpoint(Lsn lsn) {
   dwb_.truncate(0);
   dwb_.sync();
 
-  for (PageId id : dirty) frames_[id].dirty = false;
-  dirty_count_ = 0;
+  LockGuard lock(cache_mu_);
   stats_.pages_flushed += count;
   stats_.checkpoints++;
   is_new_ = false;
+}
+
+void Pager::endCheckpoint(const CheckpointSnapshot& snap) {
+  LockGuard lock(cache_mu_);
+  for (PageId id : snap.ids) {
+    auto it = frames_.find(id);
+    if (it != frames_.end() && it->second.pins > 0) it->second.pins--;
+  }
   evictIfNeeded(kInvalidPage);
+}
+
+void Pager::checkpoint(Lsn lsn) {
+  CheckpointSnapshot snap = beginCheckpoint(lsn);
+  writeCheckpoint(snap);
+  endCheckpoint(snap);
 }
 
 }  // namespace pkv

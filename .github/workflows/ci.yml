@@ -20,6 +20,10 @@ jobs:
             os: ubuntu-latest
             cxx: clang++
             cmake_args: -DCMAKE_BUILD_TYPE=Release
+          - name: Linux Clang (ThreadSanitizer)
+            os: ubuntu-latest
+            cxx: clang++
+            cmake_args: -DPKV_TSAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
           - name: Windows MSVC
             os: windows-latest
             cxx: ""
@@ -45,13 +49,13 @@ jobs:
           status=${PIPESTATUS[0]}
           # Surface failing lines as annotations so they are visible without log access.
           if [ "$status" -ne 0 ]; then
-            grep -E "FAIL|threw|error|Error|failure" test.log | head -40 | while IFS= read -r line; do
+            grep -E "FAIL|threw|error|Error|failure|Sanitizer|SUMMARY" test.log | head -40 | while IFS= read -r line; do
               echo "::error::$line"
             done
           fi
           exit "$status"
 
       - name: Randomized crash fuzzing (500 runs)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !contains(matrix.cmake_args, 'TSAN')
         working-directory: build
         run: ./crash_test fuzz 500 ${{ github.run_number }}

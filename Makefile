@@ -5,7 +5,7 @@ CXX      ?= g++
 CXXFLAGS ?= -std=c++14 -O2 -Wall -Wextra
 CPPFLAGS += -Iinclude
 
-LIB_SRC  = src/crc32.cpp src/file.cpp src/failpoint.cpp src/pager.cpp src/wal.cpp src/btree.cpp src/db.cpp
+LIB_SRC  = src/crc32.cpp src/file.cpp src/failpoint.cpp src/pager.cpp src/wal.cpp src/btree.cpp src/db.cpp src/sync.cpp
 HEADERS  = $(wildcard include/persistkv/*.h)
 
 ifeq ($(OS),Windows_NT)

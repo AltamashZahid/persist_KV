@@ -55,6 +55,7 @@ size_t File::readAt(uint64_t offset, void* buf, size_t n) {
   char* p = static_cast<char*>(buf);
   size_t done = 0;
 #ifdef _WIN32
+  LockGuard lock(io_mu_);
   if (::_lseeki64(fd_, static_cast<__int64>(offset), SEEK_SET) < 0) ioFail("seek", path_);
   while (done < n) {
     int r = ::_read(fd_, p + done, static_cast<unsigned>(n - done));
@@ -80,6 +81,7 @@ void File::writeAt(uint64_t offset, const void* buf, size_t n) {
   const char* p = static_cast<const char*>(buf);
   size_t done = 0;
 #ifdef _WIN32
+  LockGuard lock(io_mu_);
   if (::_lseeki64(fd_, static_cast<__int64>(offset), SEEK_SET) < 0) ioFail("seek", path_);
   while (done < n) {
     int r = ::_write(fd_, p + done, static_cast<unsigned>(n - done));
@@ -116,6 +118,7 @@ void File::truncate(uint64_t size) {
 
 uint64_t File::size() {
 #ifdef _WIN32
+  LockGuard lock(io_mu_);
   __int64 end = ::_lseeki64(fd_, 0, SEEK_END);
   if (end < 0) ioFail("seek", path_);
   return static_cast<uint64_t>(end);

@@ -9,6 +9,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(PKV_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(PKV_TSAN "Build with ThreadSanitizer" OFF)
 
 if(MSVC)
   add_compile_options(/W4)
@@ -19,6 +20,10 @@ else()
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all)
     add_link_options(-fsanitize=address,undefined)
   endif()
+  if(PKV_TSAN)
+    add_compile_options(-fsanitize=thread -g)
+    add_link_options(-fsanitize=thread)
+  endif()
 endif()
 
 add_library(persistkv STATIC
@@ -28,8 +33,11 @@ add_library(persistkv STATIC
   src/failpoint.cpp
   src/file.cpp
   src/pager.cpp
+  src/sync.cpp
   src/wal.cpp)
 target_include_directories(persistkv PUBLIC include)
+find_package(Threads REQUIRED)
+target_link_libraries(persistkv PUBLIC Threads::Threads)
 
 foreach(tool kvcli bench)
   add_executable(${tool} tools/${tool}.cpp)

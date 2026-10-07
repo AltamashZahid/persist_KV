@@ -3,11 +3,15 @@
 #include <cstdint>
 #include <string>
 
+#include "persistkv/sync.h"
+
 namespace pkv {
 
 // Thin positional-I/O wrapper over a raw file descriptor. No user-space
 // buffering: every writeAt goes straight to the OS, and sync() forces it to
-// stable storage (fsync on POSIX, _commit on Windows).
+// stable storage (fsync on POSIX, _commit on Windows). Safe to use from
+// several threads: POSIX pread/pwrite are atomic, and on Windows the
+// seek + read/write pair is done under a lock.
 class File {
  public:
   File() = default;
@@ -30,6 +34,9 @@ class File {
  private:
   int fd_ = -1;
   std::string path_;
+#ifdef _WIN32
+  Mutex io_mu_;  // seek and read/write are separate calls on Windows
+#endif
 };
 
 void makeDir(const std::string& path);  // no error if it already exists

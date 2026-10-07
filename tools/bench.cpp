@@ -4,12 +4,14 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "persistkv/db.h"
 #include "persistkv/file.h"
+#include "persistkv/sync.h"
 
 using namespace pkv;
 
@@ -91,6 +93,28 @@ int main(int argc, char** argv) {
         db.write(batch);
       }
     });
+  }
+
+  // Group commit: concurrent durable writers share fsyncs.
+  for (int threads : {1, 4, 16}) {
+    DB::destroy(dir);
+    DB db(dir);
+    const int per_thread = 2000 / threads;
+    char name[64];
+    std::snprintf(name, sizeof name, "durable put, %d thread%s", threads, threads == 1 ? "" : "s");
+    timeIt(name, static_cast<long>(threads) * per_thread, [&] {
+      std::vector<std::unique_ptr<Thread>> pool;
+      for (int t = 0; t < threads; t++) {
+        pool.emplace_back(new Thread());
+        pool.back()->start([&, t] {
+          for (int i = 0; i < per_thread; i++) db.put(key(t * per_thread + i), value);
+        });
+      }
+      for (auto& th : pool) th->join();
+    });
+    DBStats st = db.stats();
+    std::printf("%34s %s commits shared %s fsyncs\n", "", std::to_string(st.commit_batches).c_str(),
+                std::to_string(st.commit_groups).c_str());
   }
   return 0;
 }
