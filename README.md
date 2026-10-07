@@ -4,6 +4,10 @@ A crash-safe key-value storage engine in C++14, built on a disk-resident B+Tree,
 write-ahead log, page checksums and a doublewrite buffer. It has no dependencies
 beyond the standard library and builds with any C++14 compiler (tested on MinGW g++ 6.3).
 
+New to these ideas? **[GUIDE.md](GUIDE.md)** explains every concept from first principles:
+fsync and torn writes, B+Tree splits and merges, WAL and LSNs, checkpoints, recovery,
+steal/force, and interview questions with answers.
+
 ```
 PersistKV
  ├── DB          public API: put / get / remove / scan / checkpoint      src/db.cpp
