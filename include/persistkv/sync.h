@@ -9,7 +9,6 @@
 #ifndef _WIN32
 #include <condition_variable>
 #include <mutex>
-#include <shared_mutex>
 #include <thread>
 #endif
 
@@ -34,7 +33,10 @@ class Mutex {
 #endif
 };
 
-// Reader-writer lock: many shared holders or one exclusive holder.
+// Reader-writer lock: many shared holders or one exclusive holder. Writers
+// take priority: once one is waiting, new readers wait behind it, so a
+// steady stream of readers cannot starve writers. (glibc's default rwlock,
+// which std::shared_timed_mutex uses, prefers readers.)
 class SharedMutex {
  public:
   SharedMutex() = default;
@@ -49,7 +51,12 @@ class SharedMutex {
 #ifdef _WIN32
   void* srw_ = nullptr;
 #else
-  std::shared_timed_mutex m_;
+  std::mutex m_;
+  std::condition_variable readers_cv_;
+  std::condition_variable writers_cv_;
+  int readers_ = 0;
+  int waiting_writers_ = 0;
+  bool writer_ = false;
 #endif
 };
 

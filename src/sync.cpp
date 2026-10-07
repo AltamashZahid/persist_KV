@@ -66,10 +66,34 @@ void Thread::join() {
 void Mutex::lock() { m_.lock(); }
 void Mutex::unlock() { m_.unlock(); }
 
-void SharedMutex::lock() { m_.lock(); }
-void SharedMutex::unlock() { m_.unlock(); }
-void SharedMutex::lockShared() { m_.lock_shared(); }
-void SharedMutex::unlockShared() { m_.unlock_shared(); }
+void SharedMutex::lock() {
+  std::unique_lock<std::mutex> lock(m_);
+  waiting_writers_++;
+  writers_cv_.wait(lock, [this] { return !writer_ && readers_ == 0; });
+  waiting_writers_--;
+  writer_ = true;
+}
+
+void SharedMutex::unlock() {
+  std::lock_guard<std::mutex> lock(m_);
+  writer_ = false;
+  if (waiting_writers_ > 0) {
+    writers_cv_.notify_one();
+  } else {
+    readers_cv_.notify_all();
+  }
+}
+
+void SharedMutex::lockShared() {
+  std::unique_lock<std::mutex> lock(m_);
+  readers_cv_.wait(lock, [this] { return !writer_ && waiting_writers_ == 0; });
+  readers_++;
+}
+
+void SharedMutex::unlockShared() {
+  std::lock_guard<std::mutex> lock(m_);
+  if (--readers_ == 0 && waiting_writers_ > 0) writers_cv_.notify_one();
+}
 
 void CondVar::wait(Mutex& mu) {
   std::unique_lock<std::mutex> lock(mu.m_, std::adopt_lock);
