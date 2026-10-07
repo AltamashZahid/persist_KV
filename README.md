@@ -2,128 +2,139 @@
 
 [![CI](https://github.com/AltamashZahid/persist_KV/actions/workflows/ci.yml/badge.svg)](https://github.com/AltamashZahid/persist_KV/actions/workflows/ci.yml)
 
-A crash-safe key-value storage engine in C++14, built on a disk-resident B+Tree, a
-write-ahead log, page checksums and a doublewrite buffer. It has no dependencies
-beyond the standard library and builds with any C++14 compiler (tested on MinGW g++ 6.3).
+A crash-safe, thread-safe key-value storage engine in C++14. It is built on a
+disk-resident B+Tree with variable-size nodes and overflow pages, a write-ahead log with
+group commit, page checksums, and background checkpoints protected by a doublewrite
+buffer. It has no dependencies beyond the standard library, and it builds with any
+C++14 compiler (tested with MinGW g++ 6.3, GCC, Clang and MSVC).
 
 New to these ideas? **[GUIDE.md](GUIDE.md)** explains every concept from first principles:
-fsync and torn writes, B+Tree splits and merges, WAL and LSNs, checkpoints, recovery,
-steal/force, and interview questions with answers.
+fsync and torn writes, B+Tree splits and merges, WAL and LSNs, group commit, checkpoints,
+recovery, steal/force, and interview questions with answers.
 
+```cpp
+pkv::DB db("mydb");
+db.put("user:1", "alice");
+std::string v;
+db.get("user:1", &v);
+db.scan("user:", "user:~", [](const std::string& k, const std::string& v) { return true; });
+
+pkv::WriteBatch batch;              // all-or-nothing, one fsync
+batch.put("acct:a", "90");
+batch.put("acct:b", "110");
+db.write(batch);
 ```
-PersistKV
- ├── DB          public API: put / get / remove / scan / checkpoint      src/db.cpp
- ├── BTree       B+Tree over pages: split, borrow, merge, range scan     src/btree.cpp
- ├── Pager       page cache (LRU), free list, checkpoint + doublewrite   src/pager.cpp
- ├── Wal         append-only redo log with per-record CRC32               src/wal.cpp
- └── File        positional I/O + fsync (POSIX) / _commit (Windows)       src/file.cpp
-```
+
+## Features
+
+- **B+Tree index:** point lookups, ordered range scans over linked leaves, and
+  O(log n) insert and delete. Nodes are sized **in bytes**: they split above one page
+  and merge or redistribute below 25% full, so small entries pack hundreds per page.
+- **Keys up to 128 B, values up to 1 MiB.** Values over 512 B live in **overflow page
+  chains**, and freed pages are reused through a free list.
+- **Durability:** a write-ahead log with LSNs and CRC32 on every record. A torn tail is
+  detected and discarded on recovery.
+- **Atomic batches:** a `WriteBatch` is one WAL record, so after a crash all of it is
+  present or none of it is.
+- **Torn-page safety:** checkpoints go through a **doublewrite buffer**, and every page
+  carries a CRC32.
+- **Concurrency:** readers run in parallel. Concurrent writers are combined by **group
+  commit** into one fsync. **Checkpoints run on a background thread**, and their disk
+  I/O does not block reads or writes.
+- **Fail-safe errors:** if applying a change fails midway, the DB refuses further calls
+  and never writes the half-applied state to disk. Reopening recovers from the WAL.
 
 ## Build and run
 
 ```sh
 mingw32-make          # Windows (MinGW); use `make` on Linux/macOS
-./unit_tests          # 10 correctness tests, including comparisons against std::map
-./crash_test          # kills the engine at 14 injected points and verifies recovery
-./bench 200000        # throughput numbers
+# or: cmake -S . -B build && cmake --build build && ctest --test-dir build
+
+./unit_tests          # 18 tests: model comparisons, overflow, batches, concurrency
+./crash_test          # 14 targeted crash points + 40 randomized crash runs
+./crash_test fuzz 500 # 500 randomized crash runs (CI runs this on every push)
+./bench 50000         # throughput numbers
 ./kvcli mydb          # interactive shell: put/get/del/scan/stats/check
 ```
 
-## On-disk files
+CI builds and tests on Linux (GCC with AddressSanitizer + UBSan, Clang, and Clang with
+ThreadSanitizer) and Windows (MSVC).
 
-| File      | Purpose |
-|-----------|---------|
-| `data.db` | Array of 4 KB pages. Page 0 is the meta page (root, page count, free-list head, checkpoint LSN, key count). The other pages are B+Tree nodes or free pages. |
-| `wal.log` | Logical redo records `[crc][len][lsn][op][klen][vlen][key][value]` for every write since the last checkpoint. |
-| `dwb.log` | Doublewrite buffer. It is non-empty only while a checkpoint is in progress. |
+## Architecture
 
-Every page begins with a 16-byte header `[crc32][type][nkeys][next]`, and the CRC covers the
-whole page.
+```
+PersistKV
+ ├── DB          public API, group commit, recovery, checkpoint thread    src/db.cpp
+ ├── BTree       byte-sized B+Tree nodes, overflow chains, range scan     src/btree.cpp
+ ├── Pager       LRU page cache, free list, 3-phase checkpoint + dwb      src/pager.cpp
+ ├── Wal         batch records with CRC32, torn-tail truncation           src/wal.cpp
+ ├── sync        mutex / rwlock / condvar / thread (Win32 or std)         src/sync.cpp
+ └── File        positional I/O + fsync (POSIX) / _commit (Windows)       src/file.cpp
+```
 
-## Write path
+### On-disk files
 
-1. `put(k, v)` assigns the next **LSN** and appends a WAL record, then **fsyncs** it.
-   When `put` returns, the write is durable.
-2. The change is applied to the B+Tree **in the page cache**. Dirty pages are pinned in
-   memory, so the data file never holds a half-applied operation.
-3. Once the WAL or the dirty-page count passes a threshold, a **checkpoint** runs:
-   1. All dirty pages and the meta page are written to `dwb.log` as one checksummed
-      blob, followed by an fsync.
-   2. The same pages are written in place in `data.db`, followed by an fsync.
-   3. `dwb.log` is truncated, and then `wal.log` is truncated.
+| File | Purpose |
+|------|---------|
+| `data.db` | Array of 4 KB pages. Page 0 is the meta page (root, page count, free-list head, checkpoint LSN, key count). The rest are leaf, internal, overflow or free pages. |
+| `wal-0.log`, `wal-1.log` | Redo log: one record per committed batch. There are two files so that a running checkpoint can retire one while new commits go to the other. |
+| `dwb.log` | Doublewrite buffer. It is non-empty only while a checkpoint is being written. |
 
-## Recovery (runs on every open)
+### Write path (group commit)
+1. A writer joins the commit queue. The writer at the front becomes the **leader**. It
+   appends every queued batch to the active WAL, issues **one fsync** for all of them,
+   then applies them to the tree in memory under the exclusive tree lock.
+2. The leader wakes the other writers, whose batches are now durable and applied.
+3. When the WAL or the dirty-page count crosses a threshold, the leader signals the
+   **checkpoint thread**. If the backlog reaches 4× the threshold, writers wait for it
+   (backpressure).
 
-1. **Doublewrite repair.** If `dwb.log` is complete and its checksum is valid, the
-   previous run crashed during step 3.2 and may have left torn pages behind. All of its
-   pages are copied back into `data.db`. If the doublewrite buffer is incomplete, the
-   crash happened before any in-place write, so `data.db` is still consistent and the
-   buffer is discarded.
-2. **Load the meta page**, after verifying its checksum.
-3. **WAL replay.** Records are read in order and applied if their LSN is greater than the
-   meta page's `checkpoint_lsn`. Replay stops at the first record that is short or fails
-   its CRC. That is a torn tail from a crash mid-append, which was never acknowledged,
-   and the file is truncated there.
-4. A checkpoint makes the recovered state durable.
+### Checkpoint (background thread)
+1. **Snapshot**, briefly holding the WAL and tree locks: copy the dirty pages and the
+   meta page, mark those pages clean but **pinned** in the cache, fsync the active WAL,
+   and switch new appends to the other WAL file.
+2. **Write**, with no tree lock held: copy the pages to `dwb.log` and fsync, write them
+   in place in `data.db` and fsync, then truncate `dwb.log`.
+3. **Finish:** empty the retired WAL file and unpin the pages.
 
-Records are logical (put/delete of a key), so replaying them on top of the last
-checkpoint is idempotent.
+### Recovery (on every open)
+1. If `dwb.log` is complete and passes its CRC, copy its pages into `data.db`. This
+   repairs any torn pages. An incomplete doublewrite buffer means `data.db` was never
+   touched.
+2. Load and verify the meta page.
+3. Read both WAL files, truncating any torn tail. Sort the records by LSN and redo
+   those newer than the meta page's `checkpoint_lsn`.
+4. Checkpoint, then empty both logs.
 
-## B+Tree
+## Testing
 
-- Keys can be up to 32 bytes and values up to 200 bytes. Node capacity is derived from
-  the page size: up to **17 entries per leaf** and **107 separator keys per internal
-  node**, so a 4-level tree addresses millions of keys.
-- **Insert:** a full leaf splits in half and its right half's first key is *copied* up.
-  A full internal node splits and its middle key is *moved* up. When the root splits,
-  the tree grows by one level.
-- **Delete:** an underfull node first **borrows** from a sibling, rotating through the
-  parent separator. If neither sibling can spare a key, the node **merges** with one,
-  and the freed page goes on the **free list** for reuse. When the root runs out of
-  keys, the tree shrinks by one level.
-- **Range scan:** descend once to the start key, then follow the leaf `next` links.
-- **Read fast path:** `get` and the descent for insert, delete and scan compare keys
-  directly against the serialized page bytes. A page is decoded into a `Node` only when
-  it has to change.
-- `checkIntegrity()` verifies sorted keys, separator bounds, min/max occupancy, equal
-  leaf depth, the leaf chain, the key count, and that every page is accounted for (in
-  the tree or on the free list, with no leaks).
+| Test | What it proves |
+|---|---|
+| Model tests | 30K–75K random operations compared against `std::map`, with full integrity checks along the way (sorted keys, separator bounds, byte fill, equal leaf depth, leaf chain, overflow chains, and no leaked pages) |
+| Overflow and sizing | Values at every size boundary up to 1 MiB; chains freed and reused; dense packing of small entries |
+| Batches | Atomic commit, and a batch torn mid-record is discarded entirely |
+| Concurrency | 4 writers + 4 readers with constant background checkpoints; readers verify they never see a torn value; recovery afterwards. ThreadSanitizer in CI |
+| Crash: targeted | The engine is killed at 14 exact points (torn WAL record, torn page, between every checkpoint step). Recovery must reproduce exactly the acknowledged operations |
+| Crash: fuzzer | Random workloads (single ops, batches, overflow-sized values) crashed at random points. Half are crashed **again during recovery** |
 
-## Crash testing
+## Performance
 
-`crash_test` re-runs itself as a child process with one **failpoint** armed. The child
-performs 800 deterministic puts and deletes and logs each acknowledged operation. The
-failpoint calls `_Exit()` at an exact moment:
-
-| Failpoint | What it simulates |
-|-----------|-------------------|
-| `wal.torn` | Half a WAL record written, then a crash |
-| `db.after_wal` | Record durable but not yet applied to the tree |
-| `ckpt.after_dwb` | Doublewrite done, data file not yet touched |
-| `ckpt.torn_page` | Half a page written in place (a torn page) |
-| `ckpt.after_data` | Data file synced, doublewrite buffer not yet cleared |
-| `ckpt.before_wal_reset` | Checkpoint done, WAL not yet truncated |
-
-The parent then reopens the database and requires two things. The integrity check must
-pass, and the contents must equal the model state after every acknowledged operation
-(plus, optionally, the one in-flight operation). All 14 scenarios pass.
-
-## Performance (MinGW g++ 6.3 -O2, Windows 11, 50k keys, 100-byte values)
+MinGW g++ 6.3 -O2, Windows 11, 50K keys, 100-byte values:
 
 | Workload | ops/s |
 |---|---|
-| random get | ~110,000 |
-| range scan, 100 keys each | ~10,000 scans |
-| random put, no fsync per op, with checkpoints | ~21,000 |
-| random put, no fsync per op, checkpoints deferred | ~42,000 |
-| durable put, fsync per write | ~800–1,100 |
+| random get | ~130,000–160,000 |
+| range scan, 100 keys each | ~15,000–18,000 scans |
+| random put, no fsync per op | ~27,000 |
+| random delete | ~20,000 |
+| durable put (fsync per commit), 1 thread | ~1,000 |
+| durable put, 16 threads (group commit) | ~4,700 (2,000 commits in 236 fsyncs) |
+| durable put, `WriteBatch` of 100 | ~14,000 |
 
-The doublewrite buffer doubles checkpoint I/O. That is the cost of being safe against
-torn pages, and it can be tuned with `Options::checkpoint_dirty_pages`.
+## Limitations and next steps
 
-## Possible extensions
-
-- Slotted pages with variable-length records and overflow pages for large values
-- Group commit (batching many writers into one fsync)
-- Concurrency: a reader-writer latch, or latch crabbing on tree nodes
-- Snapshot iterators (MVCC) and prefix compression in internal nodes
+- Writers are serialized through the tree lock. Per-node latching ("latch crabbing")
+  would let writers on different subtrees run in parallel.
+- No multi-version reads: a long `scan` holds the shared lock and delays writers. MVCC
+  snapshots would fix that.
+- No prefix compression in internal nodes, and no compression of values.
