@@ -67,7 +67,7 @@ void Pager::recoverDoublewrite() {
   if (valid) {
     uint64_t count = get32(&buf[4]);
     valid = size == kDwbHeaderSize + count * kDwbEntrySize &&
-            get32(&buf[8]) == crc32(&buf[kDwbHeaderSize], size - kDwbHeaderSize);
+            get32(&buf[8]) == crc32(buf.data() + kDwbHeaderSize, size - kDwbHeaderSize);
   }
   if (valid) {
     // The checkpoint may have died mid-way through in-place writes. The

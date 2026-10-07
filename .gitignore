@@ -7,3 +7,4 @@ crash_test
 test_data/
 bench_data/
 kvdata/
+mydb/

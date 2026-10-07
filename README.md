@@ -1,5 +1,7 @@
 # PersistKV
 
+[![CI](https://github.com/AltamashZahid/persist_KV/actions/workflows/ci.yml/badge.svg)](https://github.com/AltamashZahid/persist_KV/actions/workflows/ci.yml)
+
 A crash-safe key-value storage engine in C++14, built on a disk-resident B+Tree, a
 write-ahead log, page checksums and a doublewrite buffer. It has no dependencies
 beyond the standard library and builds with any C++14 compiler (tested on MinGW g++ 6.3).

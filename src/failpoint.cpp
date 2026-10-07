@@ -8,6 +8,7 @@ namespace failpoint {
 namespace {
 std::string g_name;
 long g_countdown = 0;
+long g_hits = 0;
 }  // namespace
 
 void set(const std::string& name, long countdown) {
@@ -21,9 +22,12 @@ void clear() {
 }
 
 bool hit(const char* name) {
-  if (g_name.empty() || g_name != name) return false;
+  g_hits++;
+  if (g_name.empty() || (g_name != "any" && g_name != name)) return false;
   return --g_countdown == 0;
 }
+
+long hitCount() { return g_hits; }
 
 void crash() { std::_Exit(kCrashExitCode); }
 

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC (ASan + UBSan)
+            os: ubuntu-latest
+            cxx: g++
+            cmake_args: -DPKV_SANITIZE=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          - name: Linux Clang
+            os: ubuntu-latest
+            cxx: clang++
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+          - name: Windows MSVC
+            os: windows-latest
+            cxx: ""
+            cmake_args: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cxx }}" ]; then export CXX=${{ matrix.cxx }}; fi
+          cmake -S . -B build ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Unit and crash tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Randomized crash fuzzing (500 runs)
+        if: runner.os == 'Linux'
+        working-directory: build
+        run: ./crash_test fuzz 500 ${{ github.run_number }}
