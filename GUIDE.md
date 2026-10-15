@@ -25,6 +25,7 @@ to the file that implements it.
 17. [Interview questions and answers](#17-interview-questions)
 18. [Code reading order](#18-code-reading-order)
 19. [Further reading](#19-further-reading)
+20. [Using it from Python: the pybind11 bindings](#20-using-it-from-python)
 
 ---
 
@@ -671,6 +672,12 @@ more. RocksDB is an LSM tree; InnoDB is a B+Tree.
 Per-node latches with **latch crabbing**: latch a child, and release the ancestors once
 the child can't split or merge. Add MVCC so long scans don't block writers.
 
+**Q: How does a Python program use this C++ engine? (details in [section 20](#20-using-it-from-python))**
+Through a binding: a C++ file, compiled into a native Python module, that converts Python
+objects to C++ types, calls the engine, and converts the results back. PersistKV uses
+pybind11. The two details that matter: release the GIL around engine calls so Python
+threads really run in parallel, and translate C++ exceptions into Python exceptions.
+
 ---
 
 ## 18. Code reading order
@@ -682,6 +689,7 @@ the child can't split or merge. Add MVCC so long scans don't block writers.
 5. [src/btree.cpp](src/btree.cpp): read paths → `apply`/`modify`/`fixChild` → `splitNode`/`rebalance` → overflow cells → `check`
 6. [src/sync.cpp](src/sync.cpp), then [src/db.cpp](src/db.cpp): group commit, checkpoint thread, and recovery in the constructor
 7. [tests/crash_test.cpp](tests/crash_test.cpp), [src/failpoint.cpp](src/failpoint.cpp): how crash safety is proven
+8. [python/persistkv_py.cpp](python/persistkv_py.cpp): the Python bindings ([section 20](#20-using-it-from-python))
 
 ---
 
@@ -696,3 +704,146 @@ the child can't split or merge. Add MVCC so long scans don't block writers.
 - **LevelDB source, `DBImpl::Write`**. The group commit design used here.
 - **Dan Luu, "Files are hard"**. Why fsync correctness is difficult in practice.
 - **MySQL docs: "InnoDB Doublewrite Buffer"**, and **PostgreSQL docs: `full_page_writes`**.
+
+---
+
+## 20. Using it from Python
+
+[python/persistkv_py.cpp](python/persistkv_py.cpp), [setup.py](setup.py),
+[python/tests/test_persistkv.py](python/tests/test_persistkv.py)
+
+```python
+import persistkv
+
+with persistkv.DB("castdb") as db:
+    db.put(b"cast:rahul", b'{"hair": "short black", "glasses": true}')
+    db.get(b"cast:rahul")                    # b'{...}', or None if missing
+    db.scan_prefix(b"story:rahul:")          # [(key, value), ...] in key order
+
+    batch = persistkv.WriteBatch()           # atomic, one fsync
+    batch.put(b"story:rahul:2026-10-15", b"passed the retest")
+    batch.remove(b"draft:rahul")
+    db.write(batch)
+```
+
+The first user is **Pinch** (a chat-to-comic app), which keeps each person's character
+card, reference portrait and past stories in PersistKV.
+
+### What a binding is
+
+Python can't call C++ directly. A **binding** is a small layer, compiled into a native
+module (`persistkv.pyd` on Windows, `persistkv.so` on Linux), that Python imports like
+any other module. For each call it does three things:
+
+1. converts the Python arguments to C++ types (`bytes` → `std::string`),
+2. calls the engine,
+3. converts the result back (`std::string` → `bytes`), or turns a C++ exception into a
+   Python exception.
+
+### The options, and why pybind11
+
+| Option | How | Trade-off |
+|---|---|---|
+| **ctypes + a C API** | `extern "C"` functions in a DLL, loaded with Python's built-in `ctypes` | No Python-version coupling. But C has no exceptions or classes, so errors become return codes, memory is freed by hand, and every signature is declared again in Python |
+| **pybind11** (used here) | C++ templates that generate the conversion code | You write normal C++: classes, exceptions and `std::string` map across automatically. The module is built per Python version |
+| Cython | A Python-like language compiled to C | A third language to learn |
+| A server process | The engine runs as its own process; Python talks over a socket or pipe | Works across any compiler, but every call pays for IPC |
+
+A ctypes prototype worked too. pybind11 won because exceptions and classes cross over
+without hand-written glue.
+
+### How it is built
+
+`setup.py` compiles **the engine's sources plus the binding file into one module**, so
+there is no separate library to install. `pip install .` runs it.
+
+The compiler must be **ABI-compatible with the Python interpreter**: the same CPU width
+and a compatible C runtime. Python for Windows is a 64-bit MSVC build, so the module is
+built with MSVC (Visual Studio Build Tools). The 32-bit MinGW g++ 6.3 used for the C++
+tools can't produce a module 64-bit Python will load. On Linux it's plain g++/clang.
+
+### Exceptions across the language boundary
+
+A C++ exception must never unwind into Python's C code: that's undefined behaviour,
+usually a crash. pybind11 catches it at the boundary and raises a Python exception:
+
+```cpp
+auto error = py::register_exception<pkv::Error>(m, "Error");
+py::register_exception<pkv::CorruptionError>(m, "CorruptionError", error.ptr());
+```
+
+So `db.put(b"", b"x")` raises `persistkv.Error: key must not be empty`, and
+`persistkv.CorruptionError` is a subclass of `persistkv.Error`, mirroring the C++
+hierarchy. pybind11 tries translators **newest first**, which is why the subclass is
+registered after its base: otherwise the base translator would catch corruption errors
+first.
+
+### The GIL, and why the binding releases it
+
+CPython has a **Global Interpreter Lock**: only one thread runs Python bytecode at a
+time. If the binding held the GIL during a 1 ms fsync, every other Python thread would
+stall for that 1 ms, and the engine's concurrency would be wasted.
+
+So every engine call releases it:
+
+```cpp
+void put(const std::string& key, const std::string& value) {
+  py::gil_scoped_release nogil;   // other Python threads run from here...
+  db().put(key, value);
+}                                 // ...and the GIL is taken back here
+```
+
+This is safe because of **what happens while the GIL is released**: the arguments were
+already converted to `std::string` before the release, and no Python object is touched
+until the GIL is re-acquired. Touching a Python object without the GIL is a data race.
+
+The payoff is measurable: with 8 Python threads writing at once, their commits reach the
+engine together and **group commit** merges them into fewer fsyncs. The test
+`test_threads_share_one_db` checks `commit_groups <= commit_batches` from `stats()`.
+
+### Why `scan` collects first and converts afterwards
+
+`DB::scan` holds the tree lock (shared) while it calls the callback, and section 13 warns
+that calling back into the DB from that callback deadlocks. If the callback ran Python
+code, a user could easily do exactly that. It would also need the GIL while holding the
+tree lock, a lock-order hazard.
+
+So the binding's callback only copies each row into a `std::vector` with the GIL
+released. After the scan returns and the tree lock is dropped, it re-acquires the GIL and
+builds the Python list. **No Python code ever runs under the tree lock.** The cost is
+memory for the whole result, which is what `limit=` is for.
+
+`scan_prefix(p)` relies on B+Tree ordering: keys sharing a prefix are adjacent, so it
+starts at `p` and stops at the first key without it. A key scheme like
+`story:<person>:<date>` therefore returns one person's history, oldest first, in a
+single range scan.
+
+### Object lifetime
+
+`close()` (or leaving a `with` block) destroys the `pkv::DB`. That stops the checkpoint
+thread and checkpoints, so the next open needs no WAL replay. Later calls raise
+`persistkv.Error: database is closed` instead of touching freed memory. If a program
+exits without closing, the engine's normal crash recovery replays the WAL on the next
+open, so nothing acknowledged is lost.
+
+### Interview questions on the bindings
+
+**Q: Why release the GIL, and when is that unsafe?**
+So other Python threads keep running during disk I/O, and so concurrent writers reach
+group commit together. It's unsafe if any Python object is read or written while the GIL
+is released. Convert arguments first, then release, then re-acquire before building
+results.
+
+**Q: What happens if a C++ exception reaches Python's C code?**
+Undefined behaviour: C has no exception unwinding, so typically the process crashes.
+Bindings must catch at the boundary. pybind11 does it, and a C API returns error codes
+instead.
+
+**Q: Why can't a 32-bit compiler build a module for 64-bit Python?**
+A process can't mix 32- and 64-bit code: pointers and the calling convention differ. On
+Windows, the C runtime should also match the interpreter's.
+
+**Q: ctypes or pybind11?**
+ctypes needs no build against Python and survives Python upgrades, but you hand-write a C
+API and error codes. pybind11 gives natural C++ (classes, exceptions, STL) but must be
+rebuilt for each Python version.

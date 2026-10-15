@@ -43,6 +43,8 @@ db.write(batch);
   I/O does not block reads or writes.
 - **Fail-safe errors:** if applying a change fails midway, the DB refuses further calls
   and never writes the half-applied state to disk. Reopening recovers from the WAL.
+- **Python bindings** (pybind11): `import persistkv`. The GIL is released inside the
+  engine, so Python threads run in parallel and share group-commit fsyncs.
 
 ## Build and run
 
@@ -58,7 +60,33 @@ mingw32-make          # Windows (MinGW); use `make` on Linux/macOS
 ```
 
 CI builds and tests on Linux (GCC with AddressSanitizer + UBSan, Clang, and Clang with
-ThreadSanitizer) and Windows (MSVC).
+ThreadSanitizer) and Windows (MSVC), and builds and tests the Python module on both.
+
+## Python
+
+```sh
+pip install .                       # compiles the engine + bindings into one module
+python -m pytest python/tests -q    # 11 tests
+```
+
+```python
+import persistkv
+
+with persistkv.DB("mydb") as db:
+    db.put(b"user:1", b"alice")
+    db.get(b"user:1")                 # b"alice", or None
+    db.scan_prefix(b"user:")          # [(key, value), ...] in key order
+    batch = persistkv.WriteBatch()    # atomic, one fsync
+    batch.put(b"acct:a", b"90")
+    batch.put(b"acct:b", b"110")
+    db.write(batch)
+```
+
+Errors raise `persistkv.Error` (with `persistkv.CorruptionError` as a subclass). On
+Windows the module needs MSVC (Visual Studio Build Tools), the compiler Python itself is
+built with. [GUIDE.md section 20](GUIDE.md#20-using-it-from-python) explains how the
+bindings work: the GIL, exception translation, and why `scan` never runs Python code
+under the tree lock.
 
 ## Architecture
 

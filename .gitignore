@@ -8,3 +8,9 @@ test_data/
 bench_data/
 kvdata/
 mydb/
+build/
+*.egg-info/
+*.pyd
+*.so
+__pycache__/
+.pytest_cache/
