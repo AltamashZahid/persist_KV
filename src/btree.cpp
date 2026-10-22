@@ -8,10 +8,14 @@ namespace pkv {
 // ---------------------------------------------------------------------------
 // Serialization
 //
-// Leaf page body:     repeated [klen u16][key][cell]
+// Pages are "slotted": an array of 2-byte entry offsets precedes the
+// entries, so a lookup can binary-search a page instead of scanning it.
+//
+// Leaf page body:     [slot u16] * n, then n entries [klen u16][key][cell]
 //   cell, inline:     [0][vlen u16][value bytes]
 //   cell, overflow:   [1][vlen u32][first overflow page u32]
-// Internal page body: [child u32] * (n + 1), then repeated [klen u16][key]
+// Internal page body: [child u32] * (n + 1), [slot u16] * n, then n keys [klen u16][key]
+// (slot i is the byte offset, from the page start, of entry / key i)
 // Overflow page:      header (bytes used in the num_keys field, next page in
 //                     the next field), then up to kOverflowPayload bytes
 // ---------------------------------------------------------------------------
@@ -84,45 +88,76 @@ struct Reader {
 
 size_t keyCount(const char* page, PageId id, bool leaf) {
   uint16_t count = get16(page + kOffNumKeys);
-  // Every entry takes at least 3 bytes (leaf) or 6 bytes (internal).
-  if (count > (leaf ? kNodeCapacity / 3 : (kNodeCapacity - 4) / 6)) corrupt(id, "too many keys");
+  // A leaf entry takes at least 8 bytes (slot, length, key, cell) and an
+  // internal key at least 9 (child pointer, slot, length, key).
+  if (count > (leaf ? kNodeCapacity / 8 : (kNodeCapacity - 4) / 9)) corrupt(id, "too many keys");
   return count;
+}
+
+// Offset of the slot array.
+size_t slotBase(bool leaf, size_t count) { return kPageHeaderSize + (leaf ? 0 : 4 * (count + 1)); }
+
+// Offset of entry i, from its slot.
+size_t slotAt(const char* page, PageId id, size_t base, size_t i) {
+  size_t off = get16(page + base + 2 * i);
+  if (off < kPageHeaderSize || off + 2 > kPageSize) corrupt(id, "bad slot offset");
+  return off;
+}
+
+// Key i of a page (its slot points at [klen][key...]).
+const char* keyAt(const char* page, PageId id, size_t base, size_t i, uint16_t* len) {
+  size_t off = slotAt(page, id, base, i);
+  *len = get16(page + off);
+  if (off + 2 + *len > kPageSize) corrupt(id, "entry overflows page");
+  return page + off + 2;
 }
 
 // Read-path fast lookups that work directly on the serialized bytes, so the
 // hot paths never build a Node (which costs one heap allocation per key).
 
-// Internal page: the child to descend into for `key` (upper-bound rule).
+// Internal page: the child to descend into for `key` (upper-bound rule),
+// found by binary search over the slots.
 PageId rawChildFor(const char* page, PageId id, const std::string& key, size_t* index = nullptr) {
   size_t count = keyCount(page, id, false);
-  Reader r{page, id, kPageHeaderSize + 4 * (count + 1)};
-  size_t i = 0;
-  for (; i < count; i++) {
-    uint16_t len = r.u16();
-    const char* k = r.bytes(len);
-    if (key.compare(0, key.size(), k, len) < 0) break;
+  size_t base = slotBase(false, count);
+  size_t lo = 0, hi = count;
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    uint16_t len;
+    const char* k = keyAt(page, id, base, mid, &len);
+    if (key.compare(0, key.size(), k, len) < 0) hi = mid;
+    else lo = mid + 1;
   }
-  if (index) *index = i;
-  return get32(page + kPageHeaderSize + 4 * i);
+  if (index) *index = lo;
+  return get32(page + kPageHeaderSize + 4 * lo);
+}
+
+// Leaf page: index of the first entry with key >= `key` (binary search).
+size_t leafLowerBound(const char* page, PageId id, size_t count, const std::string& key) {
+  size_t lo = 0, hi = count;
+  while (lo < hi) {
+    size_t mid = (lo + hi) / 2;
+    uint16_t len;
+    const char* k = keyAt(page, id, kPageHeaderSize, mid, &len);
+    if (key.compare(0, key.size(), k, len) <= 0) hi = mid;
+    else lo = mid + 1;
+  }
+  return lo;
 }
 
 // Leaf page: finds `key`, copying its encoded value cell out if requested.
 bool rawLeafFind(const char* page, PageId id, const std::string& key, std::string* cell) {
   size_t count = keyCount(page, id, true);
-  Reader r{page, id, kPageHeaderSize};
-  for (size_t i = 0; i < count; i++) {
-    uint16_t klen = r.u16();
-    const char* k = r.bytes(klen);
-    size_t clen;
-    const char* c = r.cell(&clen);
-    int cmp = key.compare(0, key.size(), k, klen);
-    if (cmp == 0) {
-      if (cell) cell->assign(c, clen);
-      return true;
-    }
-    if (cmp < 0) return false;  // keys are sorted, so it is not here
-  }
-  return false;
+  size_t i = leafLowerBound(page, id, count, key);
+  if (i == count) return false;
+  Reader r{page, id, slotAt(page, id, kPageHeaderSize, i)};
+  uint16_t klen = r.u16();
+  const char* k = r.bytes(klen);
+  if (key.compare(0, key.size(), k, klen) != 0) return false;
+  size_t clen;
+  const char* c = r.cell(&clen);
+  if (cell) cell->assign(c, clen);
+  return true;
 }
 
 Node decode(const char* page, PageId id) {
@@ -133,10 +168,12 @@ Node decode(const char* page, PageId id) {
   size_t count = keyCount(page, id, n.leaf);
 
   n.keys.resize(count);
+  size_t base = slotBase(n.leaf, count);
+  if (base + 2 * count > kPageSize) corrupt(id, "slot array overflows page");
   if (n.leaf) {
-    Reader r{page, id, kPageHeaderSize};
     n.cells.resize(count);
     for (size_t i = 0; i < count; i++) {
+      Reader r{page, id, slotAt(page, id, base, i)};
       uint16_t klen = r.u16();
       n.keys[i].assign(r.bytes(klen), klen);
       size_t clen;
@@ -146,10 +183,10 @@ Node decode(const char* page, PageId id) {
   } else {
     n.children.resize(count + 1);
     for (size_t i = 0; i <= count; i++) n.children[i] = get32(page + kPageHeaderSize + 4 * i);
-    Reader r{page, id, kPageHeaderSize + 4 * (count + 1)};
     for (size_t i = 0; i < count; i++) {
-      uint16_t klen = r.u16();
-      n.keys[i].assign(r.bytes(klen), klen);
+      uint16_t klen;
+      const char* k = keyAt(page, id, base, i, &klen);
+      n.keys[i].assign(k, klen);
     }
   }
   return n;
@@ -158,11 +195,11 @@ Node decode(const char* page, PageId id) {
 // Serialized size of a node's body. This, not the entry count, decides when
 // a node splits or needs rebalancing.
 size_t nodeBytes(const Node& n) {
-  size_t bytes = 0;
+  size_t bytes = 2 * n.keys.size();  // slots
   if (n.leaf) {
     for (size_t i = 0; i < n.keys.size(); i++) bytes += 2 + n.keys[i].size() + n.cells[i].size();
   } else {
-    bytes = 4 * n.children.size();
+    bytes += 4 * n.children.size();
     for (const std::string& k : n.keys) bytes += 2 + k.size();
   }
   return bytes;
@@ -184,24 +221,24 @@ void BTree::store(const Node& n) {
   put16(page + kOffNumKeys, static_cast<uint16_t>(n.keys.size()));
   put32(page + kOffNext, n.next);
 
-  size_t off = kPageHeaderSize;
-  auto writeKey = [&](const std::string& k) {
+  size_t count = n.keys.size();
+  size_t base = slotBase(n.leaf, count);
+  size_t off = base + 2 * count;  // entries start after the slot array
+  auto writeKey = [&](size_t i, const std::string& k) {
+    put16(page + base + 2 * i, static_cast<uint16_t>(off));
     put16(page + off, static_cast<uint16_t>(k.size()));
     std::memcpy(page + off + 2, k.data(), k.size());
     off += 2 + k.size();
   };
   if (n.leaf) {
-    for (size_t i = 0; i < n.keys.size(); i++) {
-      writeKey(n.keys[i]);
+    for (size_t i = 0; i < count; i++) {
+      writeKey(i, n.keys[i]);
       std::memcpy(page + off, n.cells[i].data(), n.cells[i].size());
       off += n.cells[i].size();
     }
   } else {
-    for (PageId c : n.children) {
-      put32(page + off, c);
-      off += 4;
-    }
-    for (const std::string& k : n.keys) writeKey(k);
+    for (size_t i = 0; i < n.children.size(); i++) put32(page + kPageHeaderSize + 4 * i, n.children[i]);
+    for (size_t i = 0; i < count; i++) writeKey(i, n.keys[i]);
   }
   pager_.write(n.id, page);
 }
@@ -356,14 +393,15 @@ void BTree::scanRaw(const std::string& lo, const std::string* hi, const RawScanF
   bool first_leaf = true;
   while (true) {
     size_t count = keyCount(page, id, true);
-    Reader r{page, id, kPageHeaderSize};
-    for (size_t i = 0; i < count; i++) {
+    // In the first leaf, binary-search to the start key.
+    size_t start = first_leaf ? leafLowerBound(page, id, count, lo) : 0;
+    for (size_t i = start; i < count; i++) {
+      Reader r{page, id, slotAt(page, id, kPageHeaderSize, i)};
       uint16_t klen = r.u16();
       const char* k = r.bytes(klen);
       size_t clen;
       const char* c = r.cell(&clen);
-      if (first_leaf && lo.compare(0, lo.size(), k, klen) > 0) continue;  // before the start key
-      if (hi && hi->compare(0, hi->size(), k, klen) < 0) return;           // past the end key
+      if (hi && hi->compare(0, hi->size(), k, klen) < 0) return;  // past the end key
       bool more;
       if (static_cast<uint8_t>(c[0]) == kCellInline) {
         more = fn(k, klen, c + 3, get16(c + 1));
@@ -511,7 +549,8 @@ void BTree::splitNode(Node& n, Node& right, std::string* separator) {
   std::vector<size_t> size(count);
   size_t total = 0;
   for (size_t i = 0; i < count; i++) {
-    size[i] = n.leaf ? 2 + n.keys[i].size() + n.cells[i].size() : 2 + n.keys[i].size() + 4;
+    // Each entry also costs a 2-byte slot.
+    size[i] = n.leaf ? 2 + 2 + n.keys[i].size() + n.cells[i].size() : 2 + 2 + n.keys[i].size() + 4;
     total += size[i];
   }
 

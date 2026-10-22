@@ -23,8 +23,9 @@ constexpr uint32_t kOverflowPayload = kPageSize - kPageHeaderSize;
 // Worst-case entry sizes. Keeping each at most half a page guarantees that
 // splitting or redistributing always yields two nodes that fit and are at
 // least kNodeMinFill bytes.
-constexpr uint32_t kMaxLeafEntry = 2 + kMaxKeySize + 1 + 2 + kMaxInlineValue;
-constexpr uint32_t kMaxInternalEntry = 2 + kMaxKeySize + 4;
+// (each includes its 2-byte slot)
+constexpr uint32_t kMaxLeafEntry = 2 + 2 + kMaxKeySize + 1 + 2 + kMaxInlineValue;
+constexpr uint32_t kMaxInternalEntry = 2 + 2 + kMaxKeySize + 4;
 static_assert(kMaxLeafEntry <= kNodeCapacity / 2, "leaf entries too large for the page size");
 static_assert(kMaxInternalEntry <= kNodeCapacity / 2, "keys too large for the page size");
 
