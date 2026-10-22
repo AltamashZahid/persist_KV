@@ -81,15 +81,19 @@ class BTree {
     const std::string* value;
     bool inserted = false;
     bool removed = false;
+    // Set when the key was appended past every existing key (ascending
+    // inserts, e.g. auto-increment ids). Splits on that path then keep the
+    // left page nearly full instead of splitting it in half.
+    bool append = false;
   };
 
   Node load(PageId id);
   void store(const Node& n);
 
   void apply(Mutation& m);
-  bool modify(PageId id, Mutation& m, Node* out);
-  void fixChild(Node& parent, size_t idx, Node& child);
-  void splitNode(Node& n, Node& right, std::string* separator);
+  bool modify(PageId id, Mutation& m, Node* out, bool rightmost);
+  void fixChild(Node& parent, size_t idx, Node& child, bool append);
+  void splitNode(Node& n, Node& right, std::string* separator, bool append = false);
   void rebalance(Node& parent, size_t idx, Node& child);
 
   std::string makeCell(const std::string& value);

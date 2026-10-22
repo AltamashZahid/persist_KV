@@ -445,14 +445,14 @@ bool BTree::remove(const std::string& key) {
 void BTree::apply(Mutation& m) {
   Meta& meta = pager_.meta();
   Node root;
-  if (!modify(meta.root, m, &root)) return;
+  if (!modify(meta.root, m, &root, true)) return;
 
   if (nodeBytes(root) > kNodeCapacity) {
     // The root split: grow the tree by one level.
     Node right;
     right.id = pager_.allocate();
     std::string separator;
-    splitNode(root, right, &separator);
+    splitNode(root, right, &separator, m.append);
     store(root);
     store(right);
 
@@ -479,7 +479,7 @@ void BTree::apply(Mutation& m) {
 // Applies the mutation inside the subtree at `id`. Returns false if nothing
 // changed; otherwise *out is the modified node, not yet stored, which the
 // caller must split, rebalance, or store.
-bool BTree::modify(PageId id, Mutation& m, Node* out) {
+bool BTree::modify(PageId id, Mutation& m, Node* out, bool rightmost) {
   char page[kPageSize];
   pager_.read(id, page);
 
@@ -501,6 +501,7 @@ bool BTree::modify(PageId id, Mutation& m, Node* out) {
       n.keys.insert(n.keys.begin() + i, *m.key);
       n.cells.insert(n.cells.begin() + i, makeCell(*m.value));
       m.inserted = true;
+      m.append = rightmost && i + 1 == n.keys.size();  // past every key in the tree
     }
     *out = std::move(n);
     return true;
@@ -509,24 +510,25 @@ bool BTree::modify(PageId id, Mutation& m, Node* out) {
   // Descend without decoding; this node only changes if its child does.
   size_t idx;
   PageId child_id = rawChildFor(page, id, *m.key, &idx);
+  bool last_child = idx == get16(page + kOffNumKeys);
   Node child;
-  if (!modify(child_id, m, &child)) return false;
+  if (!modify(child_id, m, &child, rightmost && last_child)) return false;
 
   Node n = decode(page, id);
-  fixChild(n, idx, child);
+  fixChild(n, idx, child, m.append);
   *out = std::move(n);
   return true;
 }
 
 // Stores parent.children[idx] after a modification, splitting or
 // rebalancing it first if needed. May change `parent` in memory.
-void BTree::fixChild(Node& parent, size_t idx, Node& child) {
+void BTree::fixChild(Node& parent, size_t idx, Node& child, bool append) {
   size_t bytes = nodeBytes(child);
   if (bytes > kNodeCapacity) {
     Node right;
     right.id = pager_.allocate();
     std::string separator;
-    splitNode(child, right, &separator);
+    splitNode(child, right, &separator, append);
     store(child);
     store(right);
     parent.keys.insert(parent.keys.begin() + idx, separator);
@@ -543,7 +545,10 @@ void BTree::fixChild(Node& parent, size_t idx, Node& child) {
 // half. *separator is the key the parent should route on.
 //   Leaf:     the separator is copied up; it stays as right's first key.
 //   Internal: the separator moves up and is kept in neither half.
-void BTree::splitNode(Node& n, Node& right, std::string* separator) {
+// With `append` (keys arriving in ascending order) the right page gets only
+// the minimum fill instead: an even split would leave every left page half
+// empty forever, because no later key will land in it.
+void BTree::splitNode(Node& n, Node& right, std::string* separator, bool append) {
   right.leaf = n.leaf;
   size_t count = n.keys.size();
   std::vector<size_t> size(count);
@@ -554,8 +559,9 @@ void BTree::splitNode(Node& n, Node& right, std::string* separator) {
     total += size[i];
   }
 
-  // Choose the cut that minimizes the larger half.
-  size_t best = 0, best_cost = SIZE_MAX, prefix = 0;
+  // Choose the cut that minimizes the larger half (or, for appends, the
+  // latest cut that still leaves the right page at its minimum fill).
+  size_t best = 0, best_cost = SIZE_MAX, prefix = 0, append_cut = 0;
   for (size_t m = 1; m < count; m++) {
     prefix += size[m - 1];
     size_t left, rest;
@@ -572,7 +578,9 @@ void BTree::splitNode(Node& n, Node& right, std::string* separator) {
       best_cost = cost;
       best = m;
     }
+    if (append && left <= kNodeCapacity && rest >= kNodeMinFill) append_cut = m;  // keep the latest such cut
   }
+  if (append && append_cut > 0) best = append_cut;
   if (best == 0) throw Error("internal error: node " + std::to_string(n.id) + " cannot be split");
 
   if (n.leaf) {

@@ -243,6 +243,30 @@ TEST(raw_scan_matches_scan) {
   }
 }
 
+TEST(ascending_inserts_fill_pages) {
+  // Keys in ascending order (e.g. auto-increment ids) are the common case.
+  // Splitting each full page in half would leave every page 50% full.
+  DB asc(freshDir("ascending"), fastOptions());
+  DB rnd(freshDir("random_order"), fastOptions());
+  const int n = 30000;
+  std::vector<int> ids(n);
+  for (int i = 0; i < n; i++) ids[i] = i;
+  for (int i : ids) asc.put(key(i), value(i % 50));
+  std::shuffle(ids.begin(), ids.end(), std::mt19937(5));
+  for (int i : ids) rnd.put(key(i), value(i % 50));
+  CHECK_HEALTHY(asc);
+  CHECK_HEALTHY(rnd);
+  uint32_t asc_pages = asc.stats().pages, rnd_pages = rnd.stats().pages;
+  // Bytes the entries need (slot + key length + key + value cell).
+  double bytes = 0;
+  for (int i = 0; i < n; i++) bytes += 2 + 2 + key(i).size() + 3 + value(i % 50).size();
+  double fill = bytes / (static_cast<double>(asc_pages) * kNodeCapacity);
+  std::printf("         (ascending: %u pages, %.0f%% full; random order: %u pages)\n", asc_pages, fill * 100,
+              rnd_pages);
+  CHECK(fill > 0.70);             // an even split would give about 50%
+  CHECK(asc_pages <= rnd_pages);  // and no worse than random-order inserts
+}
+
 TEST(clean_reopen_needs_no_replay) {
   std::string dir = freshDir("reopen");
   {
