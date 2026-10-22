@@ -239,6 +239,12 @@ void DB::scan(const std::string& lo, const std::string& hi, const ScanFn& fn) {
   tree_.scan(lo, hi.empty() ? nullptr : &hi, fn);
 }
 
+void DB::scanRaw(const std::string& lo, const std::string& hi, const RawScanFn& fn) {
+  ensureUsable();
+  SharedLock lock(tree_mu_);
+  tree_.scanRaw(lo, hi.empty() ? nullptr : &hi, fn);
+}
+
 uint64_t DB::size() {
   SharedLock lock(tree_mu_);
   return pager_.meta().key_count;

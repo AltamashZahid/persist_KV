@@ -95,6 +95,11 @@ class DB {
   // Stop early by returning false from fn.
   void scan(const std::string& lo, const std::string& hi, const ScanFn& fn);
 
+  // Zero-copy scan: the callback gets pointers into an internal buffer that
+  // are valid only during the call. Same range rules as scan(). Faster when
+  // the caller decodes entries itself instead of keeping them.
+  void scanRaw(const std::string& lo, const std::string& hi, const RawScanFn& fn);
+
   void checkpoint();  // synchronous
   uint64_t size();
   std::string checkIntegrity();

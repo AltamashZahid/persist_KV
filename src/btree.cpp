@@ -337,6 +337,44 @@ void BTree::scan(const std::string& lo, const std::string* hi, const ScanFn& fn)
   }
 }
 
+void BTree::scanRaw(const std::string& lo, const std::string* hi, const RawScanFn& fn) {
+  char page[kPageSize];
+  PageId id = pager_.meta().root;
+  while (true) {
+    pager_.read(id, page);
+    if (isLeafPage(page, id)) break;
+    id = rawChildFor(page, id, lo);
+  }
+
+  std::string overflow;  // assembled value for cells stored out of line
+  bool first_leaf = true;
+  while (true) {
+    size_t count = keyCount(page, id, true);
+    Reader r{page, id, kPageHeaderSize};
+    for (size_t i = 0; i < count; i++) {
+      uint16_t klen = r.u16();
+      const char* k = r.bytes(klen);
+      size_t clen;
+      const char* c = r.cell(&clen);
+      if (first_leaf && lo.compare(0, lo.size(), k, klen) > 0) continue;  // before the start key
+      if (hi && hi->compare(0, hi->size(), k, klen) < 0) return;           // past the end key
+      bool more;
+      if (static_cast<uint8_t>(c[0]) == kCellInline) {
+        more = fn(k, klen, c + 3, get16(c + 1));
+      } else {
+        readCell(std::string(c, clen), &overflow);
+        more = fn(k, klen, overflow.data(), overflow.size());
+      }
+      if (!more) return;
+    }
+    PageId next = get32(page + kOffNext);
+    if (next == kInvalidPage) return;
+    id = next;
+    pager_.read(id, page);  // follow the leaf chain instead of re-descending
+    first_leaf = false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Modification
 //

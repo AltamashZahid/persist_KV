@@ -45,6 +45,10 @@ struct Node {
 
 using ScanFn = std::function<bool(const std::string& key, const std::string& value)>;
 
+// Zero-copy scan callback: key and value point into an internal page buffer
+// and are only valid until the callback returns.
+using RawScanFn = std::function<bool(const char* key, size_t key_len, const char* value, size_t value_len)>;
+
 class BTree {
  public:
   explicit BTree(Pager& pager) : pager_(pager) {}
@@ -58,6 +62,9 @@ class BTree {
   // Visits keys >= lo (and <= *hi when hi is non-null) in ascending order
   // until fn returns false.
   void scan(const std::string& lo, const std::string* hi, const ScanFn& fn);
+  // Like scan, but without building a Node or copying keys and values: the
+  // callback sees bytes straight from the leaf page.
+  void scanRaw(const std::string& lo, const std::string* hi, const RawScanFn& fn);
 
   uint32_t height();
 

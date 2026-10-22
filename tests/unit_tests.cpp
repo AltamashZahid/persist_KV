@@ -219,6 +219,30 @@ TEST(range_scan_matches_std_map) {
   CHECK(seen == 10);
 }
 
+TEST(raw_scan_matches_scan) {
+  DB db(freshDir("raw_scan"), fastOptions());
+  std::mt19937 rng(3);
+  for (int i = 0; i < 4000; i++) {
+    // Mix of inline values and values large enough for overflow pages.
+    db.put(key(rng() % 6000), std::string(rng() % 10 == 0 ? 600 + rng() % 3000 : rng() % 80, 'a' + i % 26));
+  }
+  for (int t = 0; t < 50; t++) {
+    int a = rng() % 6500, b = rng() % 6500;
+    if (a > b) std::swap(a, b);
+    std::string lo = t == 0 ? "" : key(a), hi = t == 1 ? "" : key(b);
+    std::vector<std::pair<std::string, std::string>> want, got;
+    db.scan(lo, hi, [&](const std::string& k, const std::string& v) {
+      want.push_back({k, v});
+      return want.size() < 700;
+    });
+    db.scanRaw(lo, hi, [&](const char* k, size_t kl, const char* v, size_t vl) {
+      got.push_back({std::string(k, kl), std::string(v, vl)});
+      return got.size() < 700;
+    });
+    CHECK(got == want);
+  }
+}
+
 TEST(clean_reopen_needs_no_replay) {
   std::string dir = freshDir("reopen");
   {
