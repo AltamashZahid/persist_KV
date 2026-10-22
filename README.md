@@ -144,20 +144,53 @@ PersistKV
 | Concurrency | 4 writers + 4 readers with constant background checkpoints; readers verify they never see a torn value; recovery afterwards. ThreadSanitizer in CI |
 | Crash: targeted | The engine is killed at 14 exact points (torn WAL record, torn page, between every checkpoint step). Recovery must reproduce exactly the acknowledged operations |
 | Crash: fuzzer | Random workloads (single ops, batches, overflow-sized values) crashed at random points. Half are crashed **again during recovery** |
+| Python | 11 pytest tests for the bindings: persistence, overflow values, atomic batches, threads sharing group commit |
+
+Latest full local run (Windows, MinGW g++ 6.3): the unit tests passed 3 times in a row
+(54/54), the targeted crash tests passed 14/14, the 500-run crash fuzzer had 0 failures
+(443 runs crashed mid-workload, 209 crashed again during recovery), and pytest passed
+11/11.
 
 ## Performance
 
-MinGW g++ 6.3 -O2, Windows 11, 50K keys, 100-byte values:
+### Running the benchmark
 
-| Workload | ops/s |
+```sh
+mingw32-make bench.exe
+./bench.exe 50000 C:/Temp/pkvbench    # number of keys, then a scratch directory (wiped first)
+```
+
+The benchmark uses 100-byte values and runs: random puts, random gets, range scans,
+deleting half the keys (followed by a full integrity check), then durable writes. The
+durable writes are measured one at a time, in `WriteBatch`es of 100, and from 1, 4 and
+16 threads (group commit). For stable numbers, put the scratch directory outside any
+synced folder (OneDrive, Dropbox), close heavy applications, and take the median of 3
+runs.
+
+### Results
+
+Setup: Intel Core i5-13500H, 16 GB RAM, Samsung NVMe SSD, Windows 11, MinGW g++ 6.3
+`-O2`. Median of 3 runs, 50K keys (all data fits in the 16 MB page cache):
+
+| Workload | Throughput |
 |---|---|
-| random get | ~130,000–160,000 |
-| range scan, 100 keys each | ~15,000–18,000 scans |
-| random put, no fsync per op | ~27,000 |
-| random delete | ~20,000 |
-| durable put (fsync per commit), 1 thread | ~1,000 |
-| durable put, 16 threads (group commit) | ~4,700 (2,000 commits in 236 fsyncs) |
-| durable put, `WriteBatch` of 100 | ~14,000 |
+| random get | 171,000 ops/s |
+| range scan, 100 keys each | 19,500 scans/s |
+| random put, no fsync per op | 27,600 ops/s |
+| random delete | 15,100 ops/s |
+| durable put, 1 thread (one fsync per commit) | 740 ops/s |
+| durable put, 4 threads (group commit) | 1,600 ops/s (2,000 commits in ~835 fsyncs) |
+| durable put, 16 threads (group commit) | 4,480 ops/s (2,000 commits in ~228 fsyncs), **6.1×** one thread |
+| durable put, `WriteBatch` of 100 | 11,100 ops/s |
+
+With 200K keys, the data (33 MB) is larger than the page cache, so many lookups read
+from disk: gets fall to 26,500 ops/s, puts to 6,600 ops/s and deletes to 4,700 ops/s.
+The integrity check still passes after every run.
+
+Durable-write numbers depend mostly on how long the disk takes to fsync, so they vary
+between machines and between runs. Group commit gave 4.3× to 6.1× over one thread
+across runs. Timings vary by about ±20% between runs, which is why the table reports
+medians.
 
 ## Limitations and next steps
 
