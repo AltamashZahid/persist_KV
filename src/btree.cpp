@@ -300,15 +300,21 @@ uint32_t BTree::height() {
 }
 
 bool BTree::get(const std::string& key, std::string* value) {
-  char page[kPageSize];
+  // Each level is searched in place in the page cache: no 4 KB page copy
+  // per level, only the matching cell is copied out.
   PageId id = pager_.meta().root;
-  while (true) {
-    pager_.read(id, page);
-    if (isLeafPage(page, id)) break;
-    id = rawChildFor(page, id, key);
-  }
   std::string cell;
-  if (!rawLeafFind(page, id, key, value ? &cell : nullptr)) return false;
+  bool leaf = false, found = false;
+  while (!leaf) {
+    PageId child = kInvalidPage;
+    pager_.visit(id, [&](const char* page) {
+      leaf = isLeafPage(page, id);
+      if (leaf) found = rawLeafFind(page, id, key, value ? &cell : nullptr);
+      else child = rawChildFor(page, id, key);
+    });
+    if (!leaf) id = child;
+  }
+  if (!found) return false;
   if (value) readCell(cell, value);
   return true;
 }

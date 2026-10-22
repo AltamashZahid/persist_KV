@@ -70,6 +70,18 @@ class Pager {
   bool isNew() const { return is_new_; }
 
   void read(PageId id, char* out);
+
+  // Calls fn(page) with the cached page bytes, without copying the page.
+  // The cache lock is held during fn, so fn must be short and must not call
+  // back into the pager.
+  template <typename Fn>
+  void visit(PageId id, Fn&& fn) {
+    if (id == kInvalidPage || id >= meta_.page_count) {
+      throw CorruptionError("read of out-of-range page " + std::to_string(id));
+    }
+    LockGuard lock(cache_mu_);
+    fn(static_cast<const char*>(frame(id, true).data.data()));
+  }
   void write(PageId id, const char* in);
 
   PageId allocate();  // caller must write() the page before reading it
