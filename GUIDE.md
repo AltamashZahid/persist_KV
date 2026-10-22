@@ -117,12 +117,19 @@ offset 8   4 bytes  next page: leaf right sibling / overflow chain / free list
 Page bodies, from [src/btree.cpp](src/btree.cpp):
 
 ```
-Leaf:      [klen u16][key][cell] [klen u16][key][cell] ...
+Leaf:      [slot0][slot1]...[slotN-1]  [klen u16][key][cell] [klen u16][key][cell] ...
+             slot i = 2-byte offset of entry i (sorted by key)
              cell = [0][vlen u16][value bytes]                 (inline, value ≤ 512 B)
                   | [1][vlen u32][first overflow page id]      (large value, 9 bytes)
-Internal:  [child0][child1]...[childN]  [klen][key0] ... [klen][keyN-1]
+Internal:  [child0]...[childN]  [slot0]...[slotN-1]  [klen][key0] ... [klen][keyN-1]
 Overflow:  header, then up to 4080 bytes of the value
 ```
+
+These are **slotted pages** (format version 3). Entries have different lengths, so
+without the slot array, finding a key meant reading the page front to back, about 170
+key comparisons per lookup at 100K rows. With the 2-byte offsets, `rawChildFor` and
+`rawLeafFind` **binary-search** the page (about 14 comparisons), which made lookups
+roughly 1.4 → 0.8 µs.
 
 **Serialization** converts a C++ `Node` into these bytes (`store()`), and
 **deserialization** goes back from bytes to a `Node` (`decode()`). Integers are stored
@@ -188,9 +195,23 @@ All code is in [src/btree.cpp](src/btree.cpp).
 Descend from the root using the routing rule until you reach a leaf, then look for the
 key there. That costs O(height) page reads.
 
-*Optimization:* `get` and every descent work **directly on the raw page bytes**
-(`rawChildFor`, `rawLeafFind`) and never build a `Node`. Building one allocates a string
-per key, and avoiding that made gets about 3× faster.
+*Optimizations:*
+- `get` and every descent work **directly on the raw page bytes** (`rawChildFor`,
+  `rawLeafFind`) and never build a `Node`. Building one allocates a string per key, and
+  avoiding that made gets about 3× faster.
+- `get` searches each page **in place in the page cache** (`Pager::visit`) instead of
+  copying the 4 KB page out first.
+- **`scanRaw`** is a zero-copy range scan: the callback gets pointers straight into the
+  leaf page, with no `Node` and no copied strings. The PKQL query engine decodes and
+  filters rows inside that callback.
+
+### Append-aware splits
+When keys arrive in ascending order (auto-increment ids), an even split leaves every
+left page **half empty forever**, because no later key lands in it. So when an insert
+goes past every existing key (the rightmost path of the tree), `splitNode` keeps the
+left page as full as possible and gives the new right page only its minimum fill.
+Ascending loads then fill pages to about 75% instead of 50%. SQLite, InnoDB and
+PostgreSQL all special-case this.
 
 ### 5.2 Insert, delete and update: one unified path
 Every change goes through `apply()` → `modify()` → `fixChild()`:
