@@ -137,6 +137,9 @@ class Pager {
 
   Mutex cache_mu_;  // guards everything below
   std::unordered_map<PageId, Frame> frames_;
+  // Page ids are dense (1..page_count), so cached frames are found by
+  // indexing this array instead of hashing; nullptr = not cached.
+  std::vector<Frame*> table_;
   std::list<PageId> lru_;  // front = most recently used
   size_t dirty_count_ = 0;
   PagerStats stats_;

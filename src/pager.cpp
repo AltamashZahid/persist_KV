@@ -121,11 +121,11 @@ void Pager::loadFromDisk(PageId id, char* out) {
 }
 
 Pager::Frame& Pager::frame(PageId id, bool load_from_disk) {
-  auto it = frames_.find(id);
-  if (it != frames_.end()) {
+  if (id < table_.size() && table_[id]) {
+    Frame& f = *table_[id];
     stats_.cache_hits++;
-    lru_.splice(lru_.begin(), lru_, it->second.lru);
-    return it->second;
+    if (f.lru != lru_.begin()) lru_.splice(lru_.begin(), lru_, f.lru);
+    return f;
   }
   Frame f;
   f.data.assign(kPageSize, 0);
@@ -136,6 +136,8 @@ Pager::Frame& Pager::frame(PageId id, bool load_from_disk) {
   lru_.push_front(id);
   f.lru = lru_.begin();
   Frame& ref = frames_.emplace(id, std::move(f)).first->second;
+  if (id >= table_.size()) table_.resize(std::max<size_t>(id + 1, table_.size() * 2), nullptr);
+  table_[id] = &ref;
   evictIfNeeded(id);
   return ref;
 }
@@ -150,6 +152,7 @@ void Pager::evictIfNeeded(PageId keep) {
     if (*it == keep) continue;
     auto f = frames_.find(*it);
     if (f->second.dirty || f->second.pins > 0) continue;
+    table_[*it] = nullptr;
     frames_.erase(f);
     it = lru_.erase(it);
   }

@@ -219,6 +219,23 @@ TEST(range_scan_matches_std_map) {
   CHECK(seen == 10);
 }
 
+TEST(raw_get_matches_get) {
+  Options o = fastOptions();
+  o.cache_pages = 32;  // exercise evictions with the array page table
+  DB db(freshDir("raw_get"), o);
+  std::mt19937 rng(9);
+  for (int i = 0; i < 3000; i++) {
+    db.put(key(rng() % 4000), std::string(rng() % 10 == 0 ? 600 + rng() % 3000 : rng() % 80, 'a' + i % 26));
+  }
+  for (int i = 0; i < 4500; i++) {
+    std::string k = key(i), want, got;
+    bool has = db.get(k, &want);
+    bool raw = db.getRaw(k, [&](const char* v, size_t n) { got.assign(v, n); });
+    CHECK(has == raw && got == want);
+  }
+  CHECK_HEALTHY(db);
+}
+
 TEST(raw_scan_matches_scan) {
   DB db(freshDir("raw_scan"), fastOptions());
   std::mt19937 rng(3);

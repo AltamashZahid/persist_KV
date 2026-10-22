@@ -356,6 +356,41 @@ bool BTree::get(const std::string& key, std::string* value) {
   return true;
 }
 
+bool BTree::getRaw(const std::string& key, const RawValueFn& fn) {
+  PageId id = pager_.meta().root;
+  std::string overflow_cell;  // a value stored out of line is assembled after the search
+  bool leaf = false, found = false;
+  while (!leaf) {
+    PageId child = kInvalidPage;
+    pager_.visit(id, [&](const char* page) {
+      leaf = isLeafPage(page, id);
+      if (!leaf) {
+        child = rawChildFor(page, id, key);
+        return;
+      }
+      size_t count = keyCount(page, id, true);
+      size_t i = leafLowerBound(page, id, count, key);
+      if (i == count) return;
+      Reader r{page, id, slotAt(page, id, kPageHeaderSize, i)};
+      uint16_t klen = r.u16();
+      const char* k = r.bytes(klen);
+      if (key.compare(0, key.size(), k, klen) != 0) return;
+      found = true;
+      size_t clen;
+      const char* c = r.cell(&clen);
+      if (static_cast<uint8_t>(c[0]) == kCellInline) fn(c + 3, get16(c + 1));  // straight from the cached page
+      else overflow_cell.assign(c, clen);
+    });
+    if (!leaf) id = child;
+  }
+  if (found && !overflow_cell.empty()) {
+    std::string value;
+    readCell(overflow_cell, &value);
+    fn(value.data(), value.size());
+  }
+  return found;
+}
+
 void BTree::scan(const std::string& lo, const std::string* hi, const ScanFn& fn) {
   char page[kPageSize];
   PageId id = pager_.meta().root;

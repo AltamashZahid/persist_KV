@@ -86,6 +86,9 @@ class DB {
   // Keys must be 1..kMaxKeySize bytes, values 0..kMaxValueSize bytes.
   void put(const std::string& key, const std::string& value);
   bool get(const std::string& key, std::string* value);
+  // Zero-copy get: fn receives the value bytes, valid only during the call
+  // (do not call DB methods from inside it). Returns whether the key exists.
+  bool getRaw(const std::string& key, const RawValueFn& fn);
   bool remove(const std::string& key);  // whether the key existed when called
 
   // Applies every operation in the batch atomically, with one fsync.

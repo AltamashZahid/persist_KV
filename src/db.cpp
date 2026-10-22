@@ -226,6 +226,13 @@ void DB::write(const WriteBatch& batch) {
 // Reads
 // ---------------------------------------------------------------------------
 
+bool DB::getRaw(const std::string& key, const RawValueFn& fn) {
+  validate(key, nullptr);
+  ensureUsable();
+  SharedLock lock(tree_mu_);
+  return tree_.getRaw(key, fn);
+}
+
 bool DB::get(const std::string& key, std::string* value) {
   validate(key, nullptr);
   ensureUsable();

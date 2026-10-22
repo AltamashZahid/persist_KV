@@ -50,6 +50,9 @@ using ScanFn = std::function<bool(const std::string& key, const std::string& val
 // and are only valid until the callback returns.
 using RawScanFn = std::function<bool(const char* key, size_t key_len, const char* value, size_t value_len)>;
 
+// Zero-copy point-lookup callback: the value bytes are only valid during the call.
+using RawValueFn = std::function<void(const char* value, size_t value_len)>;
+
 class BTree {
  public:
   explicit BTree(Pager& pager) : pager_(pager) {}
@@ -57,6 +60,8 @@ class BTree {
   void init();  // creates an empty root leaf for a new database
 
   bool get(const std::string& key, std::string* value);
+  // Like get, but hands the value to fn in place instead of copying it.
+  bool getRaw(const std::string& key, const RawValueFn& fn);
   bool put(const std::string& key, const std::string& value);  // true if key was new
   bool remove(const std::string& key);                         // true if key existed
 
