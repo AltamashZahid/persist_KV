@@ -392,49 +392,27 @@ bool BTree::getRaw(const std::string& key, const RawValueFn& fn) {
 }
 
 void BTree::multiGetRaw(const std::vector<std::string>& keys, const MultiValueFn& fn) {
-  PageId leaf = kInvalidPage;  // the leaf that held (or would hold) the previous key
-  std::string overflow_cell;
+  PageId leaf = kInvalidPage;  // the leaf that holds (or would hold) the previous key
+  std::string fence, overflow_cell;
+  bool has_fence = false;
   for (size_t ki = 0; ki < keys.size(); ki++) {
     const std::string& key = keys[ki];
-    // Searches `leaf` for key. With `reuse`, a key past the leaf's last key is
-    // left unresolved: it may belong to a later leaf. Keys are ascending, so
-    // a key no greater than the leaf's last key is inside the leaf's range.
-    auto search = [&](bool reuse) {
-      bool resolved = false;
-      pager_.visit(leaf, [&](const char* page) {
-        size_t count = keyCount(page, leaf, true);
-        size_t i = leafLowerBound(page, leaf, count, key);
-        if (i == count) {
-          resolved = !reuse;
-          return;
-        }
-        resolved = true;
-        Reader r{page, leaf, slotAt(page, leaf, kPageHeaderSize, i)};
-        uint16_t klen = r.u16();
-        const char* k = r.bytes(klen);
-        if (key.compare(0, key.size(), k, klen) != 0) return;
-        size_t clen;
-        const char* c = r.cell(&clen);
-        if (static_cast<uint8_t>(c[0]) == kCellInline) fn(ki, c + 3, get16(c + 1));
-        else overflow_cell.assign(c, clen);
-      });
-      return resolved;
-    };
-    if (leaf == kInvalidPage || !search(true)) {
-      PageId id = pager_.meta().root;
-      while (true) {
-        bool is_leaf = false;
-        PageId child = kInvalidPage;
-        pager_.visit(id, [&](const char* page) {
-          is_leaf = isLeafPage(page, id);
-          if (!is_leaf) child = rawChildFor(page, id, key);
-        });
-        if (is_leaf) break;
-        id = child;
-      }
-      leaf = id;
-      search(false);
-    }
+    // Keys are ascending, so the current leaf still covers this key unless
+    // the key reached the leaf's fence (the separator above it).
+    if (leaf == kInvalidPage || (has_fence && key >= fence)) leaf = leafFor(key, &fence, &has_fence);
+    pager_.visit(leaf, [&](const char* page) {
+      size_t count = keyCount(page, leaf, true);
+      size_t i = leafLowerBound(page, leaf, count, key);
+      if (i == count) return;
+      Reader r{page, leaf, slotAt(page, leaf, kPageHeaderSize, i)};
+      uint16_t klen = r.u16();
+      const char* k = r.bytes(klen);
+      if (key.compare(0, key.size(), k, klen) != 0) return;
+      size_t clen;
+      const char* c = r.cell(&clen);
+      if (static_cast<uint8_t>(c[0]) == kCellInline) fn(ki, c + 3, get16(c + 1));
+      else overflow_cell.assign(c, clen);
+    });
     if (!overflow_cell.empty()) {
       std::string value;
       readCell(overflow_cell, &value);
@@ -520,9 +498,10 @@ void BTree::scanRaw(const std::string& lo, const std::string* hi, const RawScanF
 
 // The leaf for `key`, found without decoding. *fence is set to the smallest
 // separator above the leaf (every key in the leaf is below it), if any.
-PageId BTree::leafFor(const std::string& key, std::string* fence, bool* has_fence) {
+PageId BTree::leafFor(const std::string& key, std::string* fence, bool* has_fence, std::vector<PathStep>* path) {
   PageId id = pager_.meta().root;
   if (has_fence) *has_fence = false;
+  if (path) path->clear();
   bool leaf = false;
   while (!leaf) {
     PageId child = kInvalidPage;
@@ -531,6 +510,7 @@ PageId BTree::leafFor(const std::string& key, std::string* fence, bool* has_fenc
       if (leaf) return;
       size_t idx;
       child = rawChildFor(page, id, key, &idx);
+      if (path) path->push_back({id, idx});
       size_t count = keyCount(page, id, false);
       if (fence && idx < count) {  // deeper separators are tighter bounds
         uint16_t len;
@@ -653,8 +633,171 @@ size_t BTree::mergeIntoLeaf(PageId id, const PutItem* items, size_t n, size_t* i
   return taken;
 }
 
+// Fast path for a split: the leaf's entries plus the longest prefix of items
+// (sorted, unique, inline, all belonging to this leaf) that fits in two pages
+// are cut into the leaf and a new right sibling, chosen like splitNode, and
+// the separator is inserted into the parent page in place. Returns how many
+// items were stored; 0 (nothing changed) means the general path is needed: the
+// leaf is the root, the parent is full, or an overflow value is replaced.
+size_t BTree::splitLeafWith(const std::vector<PathStep>& path, PageId id, bool rightmost, const PutItem* items, size_t n) {
+  if (path.empty()) return 0;
+  char leaf[kPageSize], parent[kPageSize];
+  pager_.visit(id, [&](const char* page) { std::memcpy(leaf, page, kPageSize); });
+  PageId parent_id = path.back().id;
+  size_t idx = path.back().child;
+  pager_.visit(parent_id, [&](const char* page) { std::memcpy(parent, page, kPageSize); });
+
+  // The merged entry sequence, as byte ranges: old entries point into
+  // `leaf`, new ones into `fresh`.
+  size_t count = keyCount(leaf, id, true);
+  struct Piece {
+    const char* p;
+    size_t len;
+  };
+  std::vector<Piece> pieces;
+  pieces.reserve(count + n);
+  std::vector<char> fresh(2 * kPageSize + kMaxLeafEntry);
+  size_t fresh_used = 0, total = 0, taken = 0, inserted = 0;
+  auto oldEntry = [&](size_t i) {
+    Reader r{leaf, id, slotAt(leaf, id, kPageHeaderSize, i)};
+    r.bytes(r.u16());
+    size_t clen;
+    r.cell(&clen);
+    size_t from = slotAt(leaf, id, kPageHeaderSize, i);
+    return Piece{leaf + from, r.off - from};
+  };
+  // `total` counts every old entry from the start, so the limit holds for the
+  // final page pair however the items interleave with the old entries.
+  for (size_t i = 0; i < count; i++) total += 2 + oldEntry(i).len;
+  const size_t limit = 2 * kNodeCapacity - kMaxLeafEntry;  // keeps a valid cut possible
+  size_t oi = 0;
+  for (; taken < n; taken++) {
+    const std::string& key = *items[taken].key;
+    size_t entry = 2 + key.size() + 3 + items[taken].value->size();
+    bool found = false;
+    size_t oj = oi, replaced = 0;
+    while (oj < count) {
+      uint16_t len;
+      const char* k = keyAt(leaf, id, kPageHeaderSize, oj, &len);
+      int c = key.compare(0, key.size(), k, len);
+      if (c < 0) break;
+      if (c == 0) {
+        Reader r{leaf, id, slotAt(leaf, id, kPageHeaderSize, oj) + 2 + len};
+        size_t clen;
+        if (static_cast<uint8_t>(r.cell(&clen)[0]) != kCellInline) return 0;  // its overflow chain must be freed
+        found = true;
+        replaced = 2 + oldEntry(oj).len;
+        break;
+      }
+      oj++;
+    }
+    size_t next_total = total - replaced + 2 + entry;
+    if (next_total > limit) break;
+    for (; oi < oj; oi++) pieces.push_back(oldEntry(oi));
+    total = next_total;
+    char* e = fresh.data() + fresh_used;
+    put16(e, static_cast<uint16_t>(key.size()));
+    std::memcpy(e + 2, key.data(), key.size());
+    e[2 + key.size()] = static_cast<char>(kCellInline);
+    put16(e + 3 + key.size(), static_cast<uint16_t>(items[taken].value->size()));
+    if (!items[taken].value->empty()) std::memcpy(e + 5 + key.size(), items[taken].value->data(), items[taken].value->size());
+    pieces.push_back({e, entry});
+    fresh_used += entry;
+    oi = found ? oj + 1 : oj;
+    if (!found) inserted++;
+  }
+  if (taken == 0) return 0;
+  // Ending in new keys past the old ones on the tree's rightmost leaf is an
+  // append: keep the left page full, as splitNode does.
+  bool append = rightmost && oi == count;
+  for (; oi < count; oi++) pieces.push_back(oldEntry(oi));
+
+  // The cut, as in splitNode: balanced, or for appends the latest cut that
+  // leaves the right page at its minimum fill.
+  size_t best = 0, best_cost = SIZE_MAX, prefix = 0, append_cut = 0;
+  for (size_t m = 1; m < pieces.size(); m++) {
+    prefix += 2 + pieces[m - 1].len;
+    size_t left = prefix, rest = total - prefix;
+    size_t cost = std::max(left, rest);
+    if (cost < best_cost) {
+      best_cost = cost;
+      best = m;
+    }
+    // Appends leave 10% of the left page free (a fill factor, as in
+    // PostgreSQL), so later updates that grow a value do not split it.
+    if (append && left <= kNodeCapacity * 9 / 10 && rest >= kNodeMinFill) append_cut = m;
+  }
+  if (append && append_cut > 0) best = append_cut;
+  if (best == 0) return 0;
+  size_t left_bytes = 0;
+  for (size_t m = 0; m < best; m++) left_bytes += 2 + pieces[m].len;
+  size_t right_bytes = total - left_bytes;
+  if (left_bytes > kNodeCapacity || right_bytes > kNodeCapacity || left_bytes < kNodeMinFill || right_bytes < kNodeMinFill) return 0;
+
+  // The separator (the right page's first key) must fit into the parent.
+  uint16_t sep_len = get16(pieces[best].p);
+  const char* sep = pieces[best].p + 2;
+  size_t pcount = keyCount(parent, parent_id, false);
+  size_t pbase = slotBase(false, pcount);
+  size_t pbytes = 4 * (pcount + 1) + 2 * pcount;
+  for (size_t i = 0; i < pcount; i++) {
+    uint16_t len;
+    keyAt(parent, parent_id, pbase, i, &len);
+    pbytes += 2 + len;
+  }
+  if (pbytes + 4 + 2 + 2 + sep_len > kNodeCapacity) return 0;  // the parent would split
+
+  // Everything fits: write the two leaves, then the parent.
+  PageId right_id = pager_.allocate();
+  auto writeLeaf = [&](PageId pid, size_t from, size_t to, PageId next) {
+    char out[kPageSize];
+    std::memset(out, 0, kPageSize);
+    out[kOffType] = static_cast<char>(PageType::Leaf);
+    put16(out + kOffNumKeys, static_cast<uint16_t>(to - from));
+    put32(out + kOffNext, next);
+    size_t off = kPageHeaderSize + 2 * (to - from);
+    for (size_t m = from; m < to; m++) {
+      put16(out + kPageHeaderSize + 2 * (m - from), static_cast<uint16_t>(off));
+      std::memcpy(out + off, pieces[m].p, pieces[m].len);
+      off += pieces[m].len;
+    }
+    pager_.write(pid, out);
+  };
+  writeLeaf(right_id, best, pieces.size(), get32(leaf + kOffNext));
+  writeLeaf(id, 0, best, right_id);
+
+  char out[kPageSize];
+  std::memset(out, 0, kPageSize);
+  std::memcpy(out, parent, kPageHeaderSize);
+  put16(out + kOffNumKeys, static_cast<uint16_t>(pcount + 1));
+  for (size_t i = 0, c = 0; i <= pcount; i++) {
+    put32(out + kPageHeaderSize + 4 * c++, get32(parent + kPageHeaderSize + 4 * i));
+    if (i == idx) put32(out + kPageHeaderSize + 4 * c++, right_id);
+  }
+  size_t nbase = slotBase(false, pcount + 1);
+  size_t off = nbase + 2 * (pcount + 1);
+  auto writeKey = [&](size_t slot, const char* k, uint16_t len) {
+    put16(out + nbase + 2 * slot, static_cast<uint16_t>(off));
+    put16(out + off, len);
+    std::memcpy(out + off + 2, k, len);
+    off += 2 + len;
+  };
+  for (size_t i = 0, slot = 0; i <= pcount; i++) {
+    if (i == idx) writeKey(slot++, sep, sep_len);
+    if (i < pcount) {
+      uint16_t len;
+      const char* k = keyAt(parent, parent_id, pbase, i, &len);
+      writeKey(slot++, k, len);
+    }
+  }
+  pager_.write(parent_id, out);
+  pager_.meta().key_count += inserted;
+  return taken;
+}
+
 void BTree::putMany(const std::vector<PutItem>& items) {
   std::string fence;
+  std::vector<PathStep> path;
   size_t j = 0;
   while (j < items.size()) {
     if (items[j].value->size() > kMaxInlineValue) {
@@ -663,11 +806,12 @@ void BTree::putMany(const std::vector<PutItem>& items) {
       continue;
     }
     bool has_fence;
-    PageId leaf = leafFor(*items[j].key, &fence, &has_fence);
+    PageId leaf = leafFor(*items[j].key, &fence, &has_fence, &path);
     size_t k = j + 1;  // the run of items that belong to this leaf
     while (k < items.size() && items[k].value->size() <= kMaxInlineValue && (!has_fence || *items[k].key < fence)) k++;
     size_t inserted;
     size_t taken = mergeIntoLeaf(leaf, &items[j], k - j, &inserted);
+    if (taken == 0) taken = splitLeafWith(path, leaf, !has_fence, &items[j], k - j);
     if (taken > 0) {
       j += taken;
     } else {

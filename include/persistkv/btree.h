@@ -112,8 +112,14 @@ class BTree {
   void store(const Node& n);
 
   void apply(Mutation& m);
+  // One internal node on the way down to a leaf, and the child taken.
+  struct PathStep {
+    PageId id;
+    size_t child;
+  };
   size_t mergeIntoLeaf(PageId id, const PutItem* items, size_t n, size_t* inserted);
-  PageId leafFor(const std::string& key, std::string* fence, bool* has_fence);
+  size_t splitLeafWith(const std::vector<PathStep>& path, PageId id, bool rightmost, const PutItem* items, size_t n);
+  PageId leafFor(const std::string& key, std::string* fence, bool* has_fence, std::vector<PathStep>* path = nullptr);
   bool modify(PageId id, Mutation& m, Node* out, bool rightmost);
   void fixChild(Node& parent, size_t idx, Node& child, bool append);
   void splitNode(Node& n, Node& right, std::string* separator, bool append = false);

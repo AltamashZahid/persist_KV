@@ -102,6 +102,21 @@ TEST(crc32_known_vector) {
   CHECK(crc32("", 0) == 0);
   // Chaining must equal a single pass.
   CHECK(crc32("6789", 4, crc32("12345", 5)) == 0xCBF43926u);
+  // The 8-bytes-at-a-time path must agree with a plain bitwise CRC at every
+  // length and alignment.
+  std::mt19937 rng(5);
+  std::string buf(300, '\0');
+  for (char& c : buf) c = static_cast<char>(rng());
+  for (size_t start = 0; start < 9; start++) {
+    for (size_t len = 0; len + start <= buf.size(); len += 7) {
+      uint32_t slow = 0xFFFFFFFFu;
+      for (size_t i = start; i < start + len; i++) {
+        slow ^= static_cast<uint8_t>(buf[i]);
+        for (int k = 0; k < 8; k++) slow = (slow & 1) ? 0xEDB88320u ^ (slow >> 1) : slow >> 1;
+      }
+      CHECK(crc32(buf.data() + start, len) == ~slow);
+    }
+  }
 }
 
 TEST(basic_put_get_update_delete) {
@@ -383,6 +398,44 @@ TEST(ascending_inserts_fill_pages) {
               rnd_pages);
   CHECK(fill > 0.70);             // an even split would give about 50%
   CHECK(asc_pages <= rnd_pages);  // and no worse than random-order inserts
+}
+
+TEST(bulk_batches_split_in_place) {
+  // Large put-only batches (an ingest) split leaves without the general
+  // path; ascending runs must still pack pages, and random overwrites mixed
+  // in must land correctly. Reopening checks the result made it to disk.
+  std::string dir = freshDir("bulk_batches");
+  const int n = 60000;
+  std::map<std::string, std::string> want;
+  {
+    DB db(dir, fastOptions());
+    std::mt19937 rng(17);
+    for (int start = 0; start < n; start += 2000) {
+      WriteBatch batch;
+      for (int i = start; i < start + 2000; i++) {
+        batch.put(key(i), value(i % 50));
+        want[key(i)] = value(i % 50);
+      }
+      for (int i = 0; i < 50; i++) {  // overwrites of earlier keys, some longer
+        int k = static_cast<int>(rng() % (start + 2000));
+        std::string v = value(k % 50) + std::string(rng() % 60, 'z');
+        batch.put(key(k), v);
+        want[key(k)] = v;
+      }
+      db.write(batch);
+    }
+    CHECK_HEALTHY(db);
+    double bytes = 0;
+    for (const auto& kv : want) bytes += 2 + 2 + kv.first.size() + 3 + kv.second.size();
+    double fill = bytes / (static_cast<double>(db.stats().pages) * kNodeCapacity);
+    std::printf("         (bulk batches: %u pages, %.0f%% full)\n", db.stats().pages, fill * 100);
+    CHECK(fill > 0.70);
+  }
+  DB db(dir, fastOptions());
+  CHECK(db.size() == want.size());
+  std::string v;
+  for (const auto& kv : want) CHECK(db.get(kv.first, &v) && v == kv.second);
+  CHECK_HEALTHY(db);
 }
 
 TEST(clean_reopen_needs_no_replay) {
