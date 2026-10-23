@@ -31,10 +31,14 @@ db.write(batch);
   O(log n) insert and delete. Nodes are sized **in bytes**: they split above one page
   and merge or redistribute below 25% full, so small entries pack hundreds per page.
 - **Zero-copy reads:** `getRaw`, `multiGetRaw` (a sorted batch of keys; neighbours
-  in the same leaf are found without a new descent from the root) and `scanRaw` hand
-  out key and value bytes straight from the cached page, which is how
+  in the same leaf are found without a new descent from the root), `scanRaw` and
+  `scanRawReverse` (newest-first, for "latest N" queries) hand out key and value bytes
+  straight from the cached page, which is how
   [PKQL](https://github.com/AltamashZahid/MY-PersistKV) decodes rows without copying.
   Pages are binary-searched through a slot array.
+- **Bulk writes:** a put-only `WriteBatch` is applied in key order. Each run of keys
+  that lands in one leaf is merged into it with a single page rebuild, and full
+  leaves split in place. Appends leave a 10% fill-factor headroom.
 - **Keys up to 128 B, values up to 1 MiB.** Values over 512 B live in **overflow page
   chains**, and freed pages are reused through a free list.
 - **Durability:** a write-ahead log with LSNs and CRC32 on every record. A torn tail is
