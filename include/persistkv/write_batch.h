@@ -24,6 +24,12 @@ class WriteBatch {
     entries_.push_back({WalOp::Put, key, value});
     bytes_ += key.size() + value.size();
   }
+  // Takes ownership of the strings instead of copying them (bulk loads).
+  void put(std::string&& key, std::string&& value) {
+    bytes_ += key.size() + value.size();
+    entries_.push_back({WalOp::Put, std::move(key), std::move(value)});
+  }
+  void reserve(size_t entries) { entries_.reserve(entries); }
   void remove(const std::string& key) {
     entries_.push_back({WalOp::Delete, key, std::string()});
     bytes_ += key.size();
