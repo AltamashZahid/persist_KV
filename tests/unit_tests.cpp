@@ -236,6 +236,42 @@ TEST(raw_get_matches_get) {
   CHECK_HEALTHY(db);
 }
 
+TEST(in_place_puts_match_a_map) {
+  // Most puts take the in-place leaf path; splits, overflow values and
+  // deletes take the general one. Mix them all and compare with a std::map.
+  Options o = fastOptions();
+  o.cache_pages = 64;
+  DB db(freshDir("in_place_puts"), o);
+  std::map<std::string, std::string> want;
+  std::mt19937 rng(21);
+  for (int i = 0; i < 20000; i++) {
+    std::string k = key(rng() % 3000);
+    int op = rng() % 10;
+    if (op == 0) {
+      db.remove(k);
+      want.erase(k);
+      continue;
+    }
+    size_t len = op == 1 ? 513 + rng() % 2000 : rng() % (op == 2 ? 500 : 40);
+    std::string v(len, static_cast<char>('a' + rng() % 26));
+    db.put(k, v);
+    want[k] = v;
+  }
+  CHECK(db.size() == want.size());
+  std::string v;
+  for (const auto& kv : want) CHECK(db.get(kv.first, &v) && v == kv.second);
+  size_t n = 0;
+  auto it = want.begin();
+  db.scan("", "", [&](const std::string& k, const std::string& val) {
+    CHECK(it != want.end() && k == it->first && val == it->second);
+    ++it;
+    n++;
+    return true;
+  });
+  CHECK(n == want.size());
+  CHECK_HEALTHY(db);
+}
+
 TEST(multi_get_matches_get) {
   Options o = fastOptions();
   o.cache_pages = 32;

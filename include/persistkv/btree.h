@@ -103,6 +103,7 @@ class BTree {
   void store(const Node& n);
 
   void apply(Mutation& m);
+  bool putInPlace(const std::string& key, const std::string& value, bool* inserted);
   bool modify(PageId id, Mutation& m, Node* out, bool rightmost);
   void fixChild(Node& parent, size_t idx, Node& child, bool append);
   void splitNode(Node& n, Node& right, std::string* separator, bool append = false);

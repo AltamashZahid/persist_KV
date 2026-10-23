@@ -179,17 +179,22 @@ Setup: Intel Core i5-13500H, 16 GB RAM, Samsung NVMe SSD, Windows 11, MinGW g++ 
 
 | Workload | Throughput |
 |---|---|
-| random get | 171,000 ops/s |
+| random get | 228,000 ops/s |
 | range scan, 100 keys each | 19,500 scans/s |
-| random put, no fsync per op | 27,600 ops/s |
-| random delete | 15,100 ops/s |
-| durable put, 1 thread (one fsync per commit) | 740 ops/s |
-| durable put, 4 threads (group commit) | 1,600 ops/s (2,000 commits in ~835 fsyncs) |
-| durable put, 16 threads (group commit) | 4,480 ops/s (2,000 commits in ~228 fsyncs), **6.1×** one thread |
-| durable put, `WriteBatch` of 100 | 11,100 ops/s |
+| random put, no fsync per op | 92,400 ops/s |
+| random delete | 30,500 ops/s |
+| durable put, 1 thread (one fsync per commit) | 1,440 ops/s |
+| durable put, 4 threads (group commit) | 2,640 ops/s (2,000 commits in ~810 fsyncs) |
+| durable put, 16 threads (group commit) | 7,380 ops/s (2,000 commits in ~239 fsyncs), **5.1×** one thread |
+| durable put, `WriteBatch` of 100 | 85,200 ops/s |
 
-With 200K keys, the data (33 MB) is larger than the page cache, so many lookups read
-from disk: gets fall to 26,500 ops/s, puts to 6,600 ops/s and deletes to 4,700 ops/s.
+Puts are fast because most of them change only their leaf page, in place: the new
+leaf is assembled from byte ranges of the cached page, with no decoding into nodes.
+Only splits, merges and values stored in overflow pages take the general path (3.3×
+faster random puts and 7.6× faster batched puts than before this was added).
+
+With 200K keys, the data is larger than the page cache, so many operations read from
+disk: puts fall to 17,500 ops/s, gets to 21,600 ops/s and deletes to 5,700 ops/s.
 The integrity check still passes after every run.
 
 Durable-write numbers depend mostly on how long the disk takes to fsync, so they vary

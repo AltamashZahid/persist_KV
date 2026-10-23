@@ -518,7 +518,101 @@ void BTree::scanRaw(const std::string& lo, const std::string* hi, const RawScanF
 // either direction, so the same check repeats at every level up to the root.
 // ---------------------------------------------------------------------------
 
+// Fast path for the common put: an inline value whose leaf still fits after
+// the change. The leaf page is rebuilt from byte ranges of the cached page
+// (no Node, no per-key allocations) and no other page changes. Returns false,
+// having changed nothing, when the general path is needed: a split, an
+// overflow value to replace, an underfull leaf, or a page not laid out
+// contiguously.
+bool BTree::putInPlace(const std::string& key, const std::string& value, bool* inserted) {
+  const PageId root = pager_.meta().root;
+  PageId id = root;
+  bool leaf = false;
+  while (!leaf) {
+    PageId child = kInvalidPage;
+    pager_.visit(id, [&](const char* page) {
+      leaf = isLeafPage(page, id);
+      if (!leaf) child = rawChildFor(page, id, key);
+    });
+    if (!leaf) id = child;
+  }
+
+  char out[kPageSize];
+  bool ok = false;
+  pager_.visit(id, [&](const char* page) {
+    size_t count = keyCount(page, id, true);
+    size_t first = kPageHeaderSize + 2 * count;  // where the entries start
+    size_t end = first;                          // where they end
+    if (count > 0) {
+      if (slotAt(page, id, kPageHeaderSize, 0) != first) return;  // not contiguous
+      Reader last{page, id, slotAt(page, id, kPageHeaderSize, count - 1)};
+      last.bytes(last.u16());
+      size_t clen;
+      last.cell(&clen);
+      end = last.off;
+    }
+    size_t i = leafLowerBound(page, id, count, key);
+    bool found = false;
+    size_t old_start = i < count ? slotAt(page, id, kPageHeaderSize, i) : end;  // entry i, or the end
+    size_t old_end = old_start;
+    if (i < count) {
+      Reader r{page, id, old_start};
+      uint16_t klen = r.u16();
+      const char* k = r.bytes(klen);
+      if (key.compare(0, key.size(), k, klen) == 0) {
+        found = true;
+        size_t clen;
+        const char* c = r.cell(&clen);
+        if (static_cast<uint8_t>(c[0]) != kCellInline) return;  // its overflow chain must be freed
+        old_end = r.off;
+      }
+    }
+    size_t entry = 2 + key.size() + 3 + value.size();
+    size_t new_count = count + (found ? 0 : 1);
+    size_t body = (end - kPageHeaderSize) - (old_end - old_start) + entry + (found ? 0 : 2);
+    if (body > kNodeCapacity) return;                     // needs a split
+    if (body < kNodeMinFill && id != root) return;        // a smaller value left it underfull: rebalance
+
+    std::memcpy(out, page, kPageHeaderSize);
+    put16(out + kOffNumKeys, static_cast<uint16_t>(new_count));
+    size_t new_first = kPageHeaderSize + 2 * new_count;
+    // Entries before i move by the change in slot-array size.
+    size_t off = new_first;
+    std::memcpy(out + off, page + first, old_start - first);
+    for (size_t j = 0; j < i; j++) {
+      put16(out + kPageHeaderSize + 2 * j, static_cast<uint16_t>(slotAt(page, id, kPageHeaderSize, j) - first + new_first));
+    }
+    off += old_start - first;
+    // The new entry.
+    put16(out + kPageHeaderSize + 2 * i, static_cast<uint16_t>(off));
+    put16(out + off, static_cast<uint16_t>(key.size()));
+    std::memcpy(out + off + 2, key.data(), key.size());
+    out[off + 2 + key.size()] = static_cast<char>(kCellInline);
+    put16(out + off + 3 + key.size(), static_cast<uint16_t>(value.size()));
+    if (!value.empty()) std::memcpy(out + off + 5 + key.size(), value.data(), value.size());
+    off += entry;
+    // Entries after i (from old_end; a replaced entry is skipped).
+    size_t after = found ? i + 1 : i;
+    std::memcpy(out + off, page + old_end, end - old_end);
+    for (size_t j = after; j < count; j++) {
+      size_t new_j = found ? j : j + 1;
+      put16(out + kPageHeaderSize + 2 * new_j,
+            static_cast<uint16_t>(slotAt(page, id, kPageHeaderSize, j) - old_end + off));
+    }
+    off += end - old_end;
+    std::memset(out + off, 0, kPageSize - off);
+    *inserted = !found;
+    ok = true;
+  });
+  if (!ok) return false;
+  pager_.write(id, out);
+  if (*inserted) pager_.meta().key_count++;
+  return true;
+}
+
 bool BTree::put(const std::string& key, const std::string& value) {
+  bool inserted = false;
+  if (value.size() <= kMaxInlineValue && putInPlace(key, value, &inserted)) return inserted;
   Mutation m{&key, &value};
   apply(m);
   return m.inserted;
