@@ -318,7 +318,12 @@ The cache maps `PageId → Frame { 4096 bytes, dirty flag, pin count, LRU positi
 - **Write:** modify the cached copy and mark it **dirty**.
 - **Eviction:** drop the least recently used page that is **clean and unpinned**. Dirty
   pages are never evicted; they wait for a checkpoint (§12). Pinned pages are being
-  written by a running checkpoint (§10).
+  written by a running checkpoint (§10). Such pages are kept in a separate list
+  (`held_`) rather than the LRU list, and go back to it once a checkpoint has written
+  them. That way eviction never walks past pages it cannot drop. The first version
+  skipped them inside one list, and after a bulk load, with thousands of dirty pages,
+  every cache miss scanned them all: loading 1M events and then running `analyze`
+  was 4× slower because of it.
 - **Thread safety:** one mutex (`cache_mu_`) guards the frame table, so any number of
   readers can use the cache at once.
 
