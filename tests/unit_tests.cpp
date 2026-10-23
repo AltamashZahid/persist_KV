@@ -272,6 +272,40 @@ TEST(in_place_puts_match_a_map) {
   CHECK_HEALTHY(db);
 }
 
+TEST(sorted_batches_match_a_map) {
+  // Put-only batches are applied in key order, merged into leaves. Batches
+  // mix ascending runs, random keys, repeated keys and overflow values.
+  Options o = fastOptions();
+  o.cache_pages = 64;
+  DB db(freshDir("sorted_batches"), o);
+  std::map<std::string, std::string> want;
+  std::mt19937 rng(33);
+  int next = 0;
+  for (int b = 0; b < 300; b++) {
+    WriteBatch batch;
+    size_t n = 1 + rng() % 200;
+    for (size_t i = 0; i < n; i++) {
+      std::string k = b % 3 == 0 ? key(100000 + next++) : key(rng() % 5000);
+      size_t len = rng() % 50 == 0 ? 600 + rng() % 1500 : rng() % (b % 2 ? 300 : 30);
+      std::string v(len, static_cast<char>('a' + rng() % 26));
+      batch.put(k, v);
+      want[k] = v;
+    }
+    db.write(batch);
+    if (b % 50 == 49) {  // some deletes in between, through the general path
+      for (int i = 0; i < 100; i++) {
+        std::string k = key(rng() % 5000);
+        db.remove(k);
+        want.erase(k);
+      }
+    }
+  }
+  CHECK(db.size() == want.size());
+  std::string v;
+  for (const auto& kv : want) CHECK(db.get(kv.first, &v) && v == kv.second);
+  CHECK_HEALTHY(db);
+}
+
 TEST(multi_get_matches_get) {
   Options o = fastOptions();
   o.cache_pages = 32;

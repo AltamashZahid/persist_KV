@@ -70,6 +70,15 @@ class BTree {
   // the same leaf are found there without descending from the root again.
   void multiGetRaw(const std::vector<std::string>& sorted_keys, const MultiValueFn& fn);
   bool put(const std::string& key, const std::string& value);  // true if key was new
+
+  // One put of a sorted batch.
+  struct PutItem {
+    const std::string* key;
+    const std::string* value;
+  };
+  // Applies puts whose keys are sorted and unique. Runs of keys that land in
+  // the same leaf are merged into it with one page rebuild.
+  void putMany(const std::vector<PutItem>& items);
   bool remove(const std::string& key);                         // true if key existed
 
   // Visits keys >= lo (and <= *hi when hi is non-null) in ascending order
@@ -103,7 +112,8 @@ class BTree {
   void store(const Node& n);
 
   void apply(Mutation& m);
-  bool putInPlace(const std::string& key, const std::string& value, bool* inserted);
+  size_t mergeIntoLeaf(PageId id, const PutItem* items, size_t n, size_t* inserted);
+  PageId leafFor(const std::string& key, std::string* fence, bool* has_fence);
   bool modify(PageId id, Mutation& m, Node* out, bool rightmost);
   void fixChild(Node& parent, size_t idx, Node& child, bool append);
   void splitNode(Node& n, Node& right, std::string* separator, bool append = false);

@@ -111,7 +111,27 @@ void DB::ensureUsable() const {
 }
 
 void DB::applyBatch(const WriteBatch& batch) {
-  for (const WriteBatch::Entry& e : batch.entries()) {
+  const std::vector<WriteBatch::Entry>& entries = batch.entries();
+  bool puts_only = entries.size() >= 8;
+  for (const WriteBatch::Entry& e : entries) puts_only = puts_only && e.op == WalOp::Put;
+  if (puts_only) {
+    // Applied in key order, so neighbouring keys are merged into their leaf
+    // together. The stable sort keeps a key's writes in order, and only the
+    // last one is applied, so the result is the same as applying in order.
+    std::vector<size_t> order(entries.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return entries[a].key < entries[b].key; });
+    std::vector<BTree::PutItem> items;
+    items.reserve(order.size());
+    for (size_t i : order) {
+      BTree::PutItem item{&entries[i].key, &entries[i].value};
+      if (!items.empty() && *items.back().key == entries[i].key) items.back() = item;
+      else items.push_back(item);
+    }
+    tree_.putMany(items);
+    return;
+  }
+  for (const WriteBatch::Entry& e : entries) {
     if (e.op == WalOp::Put) {
       tree_.put(e.key, e.value);
     } else {
