@@ -1,6 +1,7 @@
 #pragma once
 
 #include <list>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,8 +57,10 @@ struct CheckpointSnapshot {
 // eviction; dirty pages stay in memory until the next checkpoint, so the data
 // file only ever changes inside a checkpoint.
 //
-// Thread safety: the page cache is guarded by an internal mutex, so read()
-// may be called from many threads at once. Calls that change the tree
+// Thread safety: the page cache is split into shards by page id, each with
+// its own mutex, LRU lists and frame table (lock striping, like PostgreSQL's
+// buffer-mapping partitions), so read() and visit() from many threads at
+// once rarely contend. Calls that change the tree
 // (write, allocate, free, meta()) must be serialized by the caller; the DB
 // does so with its tree lock.
 class Pager {
@@ -72,26 +75,27 @@ class Pager {
   void read(PageId id, char* out);
 
   // Calls fn(page) with the cached page bytes, without copying the page.
-  // The cache lock is held during fn, so fn must be short and must not call
-  // back into the pager.
+  // The page's shard lock is held during fn, so fn must be short and must
+  // not call back into the pager.
   template <typename Fn>
   void visit(PageId id, Fn&& fn) {
     if (id == kInvalidPage || id >= meta_.page_count) {
       throw CorruptionError("read of out-of-range page " + std::to_string(id));
     }
+    Shard& sh = shardOf(id);
     {
-      LockGuard lock(cache_mu_);
-      if (Frame* f = cachedFrame(id)) {
+      LockGuard lock(sh.mu);
+      if (Frame* f = cachedFrame(sh, id)) {
         fn(static_cast<const char*>(f->data.data()));
         return;
       }
     }
-    // A miss reads (and checksums) the page without the cache lock, so
+    // A miss reads (and checksums) the page without the shard's lock, so
     // misses from several threads overlap; then the first copy cached wins.
     std::vector<char> buf(kPageSize);
     loadFromDisk(id, buf.data());
-    LockGuard lock(cache_mu_);
-    fn(static_cast<const char*>(installLoaded(id, std::move(buf)).data.data()));
+    LockGuard lock(sh.mu);
+    fn(static_cast<const char*>(installLoaded(sh, id, std::move(buf)).data.data()));
   }
   void write(PageId id, const char* in);
 
@@ -128,20 +132,40 @@ class Pager {
     std::vector<char> data;
     bool dirty = false;
     int pins = 0;  // > 0 while a checkpoint is writing this page out
-    bool held = false;  // in held_ (dirty or pinned) rather than lru_
+    bool held = false;  // in the shard's held list (dirty or pinned) rather than its LRU list
     std::list<PageId>::iterator lru;
   };
 
-  void hold(Frame& f);     // dirty or pinned: out of the eviction list
-  void release(Frame& f);  // clean and unpinned again: back into it
+  // One stripe of the cache. Clean, unpinned pages are in `lru` (front =
+  // most recently used): every page there can be evicted. Dirty and pinned
+  // pages wait in `held` until a checkpoint has written them, so eviction
+  // never walks past pages it cannot drop.
+  struct Shard {
+    Mutex mu;  // guards everything below
+    std::unordered_map<PageId, Frame> frames;
+    // Page ids are dense, so a shard's frames are found by indexing this
+    // array with id / shard count instead of hashing; nullptr = not cached.
+    std::vector<Frame*> table;
+    std::list<PageId> lru;
+    std::list<PageId> held;
+    size_t capacity = 0;
+    size_t dirty = 0;
+    uint64_t hits = 0, misses = 0;
+  };
+  Shard& shardOf(PageId id) { return *shards_[id % shards_.size()]; }
+  Frame*& slot(Shard& sh, PageId id);  // sh.table entry for id, growing the table
 
-  Frame& frame(PageId id, bool load_from_disk);  // cache_mu_ must be held
-  Frame* cachedFrame(PageId id);                  // a hit (moved to the LRU front), or null; cache_mu_ held
+  void hold(Shard& sh, Frame& f);     // dirty or pinned: out of the eviction list
+  void release(Shard& sh, Frame& f);  // clean and unpinned again: back into it
+
+  // All with the shard's lock held:
+  Frame& frame(Shard& sh, PageId id, bool load_from_disk);
+  Frame* cachedFrame(Shard& sh, PageId id);  // a hit (moved to the LRU front), or null
   // Caches a page read from disk, unless another thread cached it first
-  // (then that copy is returned). cache_mu_ held.
-  Frame& installLoaded(PageId id, std::vector<char> data);
+  // (then that copy is returned).
+  Frame& installLoaded(Shard& sh, PageId id, std::vector<char> data);
+  void evictIfNeeded(Shard& sh, PageId keep);
   void loadFromDisk(PageId id, char* out);
-  void evictIfNeeded(PageId keep);  // cache_mu_ must be held
   void recoverDoublewrite();
   void encodeMeta(char* page) const;
   void decodeMeta(const char* page);
@@ -154,17 +178,8 @@ class Pager {
   bool is_new_ = false;
   Meta meta_;
 
-  Mutex cache_mu_;  // guards everything below
-  std::unordered_map<PageId, Frame> frames_;
-  // Page ids are dense (1..page_count), so cached frames are found by
-  // indexing this array instead of hashing; nullptr = not cached.
-  std::vector<Frame*> table_;
-  // Clean, unpinned pages, front = most recently used: every page here can
-  // be evicted. Dirty and pinned pages wait in held_ until a checkpoint has
-  // written them, so eviction never walks past pages it cannot drop.
-  std::list<PageId> lru_;
-  std::list<PageId> held_;
-  size_t dirty_count_ = 0;
+  std::vector<std::unique_ptr<Shard>> shards_;
+  Mutex stats_mu_;  // guards stats_ (checkpoint counters) and is_new_ updates
   PagerStats stats_;
 };
 

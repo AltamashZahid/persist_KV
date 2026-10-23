@@ -2,16 +2,18 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "persistkv/sync.h"
 
 namespace pkv {
 
-// Thin positional-I/O wrapper over a raw file descriptor. No user-space
-// buffering: every writeAt goes straight to the OS, and sync() forces it to
-// stable storage (fsync on POSIX, _commit on Windows). Safe to use from
-// several threads: POSIX pread/pwrite are atomic, and on Windows the
-// seek + read/write pair is done under a lock.
+// Thin positional-I/O wrapper over a raw file. No user-space buffering:
+// every writeAt goes straight to the OS, and sync() forces it to stable
+// storage (fsync on POSIX, FlushFileBuffers on Windows). Safe to use from
+// several threads, in parallel: pread/pwrite on POSIX; on Windows,
+// ReadFile/WriteFile at explicit offsets, with a pool of read handles
+// because Windows serializes the I/O of any one handle.
 class File {
  public:
   File() = default;
@@ -32,10 +34,16 @@ class File {
   const std::string& path() const { return path_; }
 
  private:
-  int fd_ = -1;
-  std::string path_;
 #ifdef _WIN32
+  void* handle_ = nullptr;  // HANDLE for writes, sync, size and truncate
+  void* takeReader();       // a read-only HANDLE for one read, from the pool
+  void giveReader(void* r);
+  Mutex readers_mu_;
+  std::vector<void*> readers_;  // idle read handles
+#else
+  int fd_ = -1;
 #endif
+  std::string path_;
 };
 
 void makeDir(const std::string& path);  // no error if it already exists

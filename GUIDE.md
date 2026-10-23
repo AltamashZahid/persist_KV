@@ -324,8 +324,19 @@ The cache maps `PageId → Frame { 4096 bytes, dirty flag, pin count, LRU positi
   skipped them inside one list, and after a bulk load, with thousands of dirty pages,
   every cache miss scanned them all: loading 1M events and then running `analyze`
   was 4× slower because of it.
-- **Thread safety:** one mutex (`cache_mu_`) guards the frame table, so any number of
-  readers can use the cache at once.
+- **Thread safety, and why the cache is striped:** the cache is split into up to 16
+  **shards** by page id. Each has its own mutex, LRU lists and frame table (lock
+  striping, as in PostgreSQL's buffer-mapping partitions). With a single mutex, 16
+  threads scanning in parallel queued on it, and were slower than 4 even when every
+  page was cached. A miss reads and checksums the page **without** holding the
+  shard's lock, then caches it unless another thread got there first. That is safe
+  because pages only change under the exclusive tree lock, and pages a checkpoint is
+  writing stay pinned in the cache.
+- **Parallel reads on Windows:** Windows serializes all I/O on one file handle. So
+  reads borrow a read-only handle from a small pool, and every read and write is
+  positional (an offset per call, like `pread`/`pwrite`), never "seek, then read".
+  A shared file pointer let one thread's read move another thread's write, which the
+  unit tests caught.
 
 **Free list.** Freed pages (from merges or overflow chains) are linked through their own
 `next` field, starting from `meta.free_head`. `allocate()` pops from the list and only

@@ -37,7 +37,14 @@ bool verifyChecksum(const char* page) { return get32(page) == crc32(page + 4, kP
 Pager::Pager(std::string data_path, std::string dwb_path, size_t cache_pages)
     : data_path_(std::move(data_path)),
       dwb_path_(std::move(dwb_path)),
-      capacity_(std::max<size_t>(cache_pages, 16)) {}
+      capacity_(std::max<size_t>(cache_pages, 16)) {
+  // Up to 16 shards, each holding at least 64 pages (small caches keep one).
+  size_t n = std::min<size_t>(16, std::max<size_t>(1, capacity_ / 64));
+  for (size_t i = 0; i < n; i++) {
+    shards_.emplace_back(new Shard());
+    shards_.back()->capacity = (capacity_ + n - 1) / n;
+  }
+}
 
 void Pager::open() {
   data_.open(data_path_);
@@ -120,74 +127,65 @@ void Pager::loadFromDisk(PageId id, char* out) {
   if (!verifyChecksum(out)) throw CorruptionError("checksum mismatch on page " + std::to_string(id));
 }
 
-Pager::Frame* Pager::cachedFrame(PageId id) {
-  if (id >= table_.size() || !table_[id]) return nullptr;
-  Frame& f = *table_[id];
-  stats_.cache_hits++;
-  if (!f.held && f.lru != lru_.begin()) lru_.splice(lru_.begin(), lru_, f.lru);
+Pager::Frame*& Pager::slot(Shard& sh, PageId id) {
+  size_t i = id / shards_.size();
+  if (i >= sh.table.size()) sh.table.resize(std::max<size_t>(i + 1, sh.table.size() * 2), nullptr);
+  return sh.table[i];
+}
+
+Pager::Frame* Pager::cachedFrame(Shard& sh, PageId id) {
+  size_t i = id / shards_.size();
+  if (i >= sh.table.size() || !sh.table[i]) return nullptr;
+  Frame& f = *sh.table[i];
+  sh.hits++;
+  if (!f.held && f.lru != sh.lru.begin()) sh.lru.splice(sh.lru.begin(), sh.lru, f.lru);
   return &f;
 }
 
-Pager::Frame& Pager::installLoaded(PageId id, std::vector<char> data) {
-  if (Frame* f = cachedFrame(id)) return *f;
-  stats_.cache_misses++;
+Pager::Frame& Pager::installLoaded(Shard& sh, PageId id, std::vector<char> data) {
+  if (Frame* f = cachedFrame(sh, id)) return *f;
+  sh.misses++;
   Frame f;
   f.data = std::move(data);
-  lru_.push_front(id);
-  f.lru = lru_.begin();
-  Frame& ref = frames_.emplace(id, std::move(f)).first->second;
-  if (id >= table_.size()) table_.resize(std::max<size_t>(id + 1, table_.size() * 2), nullptr);
-  table_[id] = &ref;
-  evictIfNeeded(id);
+  sh.lru.push_front(id);
+  f.lru = sh.lru.begin();
+  Frame& ref = sh.frames.emplace(id, std::move(f)).first->second;
+  slot(sh, id) = &ref;
+  evictIfNeeded(sh, id);
   return ref;
 }
 
-Pager::Frame& Pager::frame(PageId id, bool load_from_disk) {
-  if (id < table_.size() && table_[id]) {
-    Frame& f = *table_[id];
-    stats_.cache_hits++;
-    if (!f.held && f.lru != lru_.begin()) lru_.splice(lru_.begin(), lru_, f.lru);
-    return f;
-  }
-  Frame f;
-  f.data.assign(kPageSize, 0);
-  if (load_from_disk) {
-    stats_.cache_misses++;
-    loadFromDisk(id, f.data.data());
-  }
-  lru_.push_front(id);
-  f.lru = lru_.begin();
-  Frame& ref = frames_.emplace(id, std::move(f)).first->second;
-  if (id >= table_.size()) table_.resize(std::max<size_t>(id + 1, table_.size() * 2), nullptr);
-  table_[id] = &ref;
-  evictIfNeeded(id);
-  return ref;
+Pager::Frame& Pager::frame(Shard& sh, PageId id, bool load_from_disk) {
+  if (Frame* f = cachedFrame(sh, id)) return *f;
+  std::vector<char> data(kPageSize, 0);
+  if (load_from_disk) loadFromDisk(id, data.data());
+  return installLoaded(sh, id, std::move(data));
 }
 
-void Pager::evictIfNeeded(PageId keep) {
+void Pager::evictIfNeeded(Shard& sh, PageId keep) {
   // Drop clean pages from the cold end. Dirty pages cannot be evicted (the
   // data file may only change during a checkpoint), so the cache can
-  // temporarily grow past capacity until the next one. They are not in lru_
-  // at all, so this never walks past them: it used to, and with the cache
-  // full of dirty pages after a bulk load every miss scanned all of them.
-  while (frames_.size() > capacity_ && !lru_.empty()) {
-    PageId id = lru_.back();
+  // temporarily grow past capacity until the next one. They are not in the
+  // LRU list at all, so this never walks past them: it used to, and with the
+  // cache full of dirty pages after a bulk load every miss scanned them all.
+  while (sh.frames.size() > sh.capacity && !sh.lru.empty()) {
+    PageId id = sh.lru.back();
     if (id == keep) break;
-    table_[id] = nullptr;
-    frames_.erase(id);
-    lru_.pop_back();
+    slot(sh, id) = nullptr;
+    sh.frames.erase(id);
+    sh.lru.pop_back();
   }
 }
 
-void Pager::hold(Frame& f) {
+void Pager::hold(Shard& sh, Frame& f) {
   if (f.held) return;
-  held_.splice(held_.begin(), lru_, f.lru);
+  sh.held.splice(sh.held.begin(), sh.lru, f.lru);
   f.held = true;
 }
 
-void Pager::release(Frame& f) {
+void Pager::release(Shard& sh, Frame& f) {
   if (!f.held || f.dirty || f.pins > 0) return;
-  lru_.splice(lru_.begin(), held_, f.lru);
+  sh.lru.splice(sh.lru.begin(), sh.held, f.lru);
   f.held = false;
 }
 
@@ -195,30 +193,32 @@ void Pager::read(PageId id, char* out) {
   if (id == kInvalidPage || id >= meta_.page_count) {
     throw CorruptionError("read of out-of-range page " + std::to_string(id));
   }
+  Shard& sh = shardOf(id);
   {
-    LockGuard lock(cache_mu_);
-    if (Frame* f = cachedFrame(id)) {
+    LockGuard lock(sh.mu);
+    if (Frame* f = cachedFrame(sh, id)) {
       std::memcpy(out, f->data.data(), kPageSize);
       return;
     }
   }
   std::vector<char> buf(kPageSize);
-  loadFromDisk(id, buf.data());  // without the cache lock, as in visit()
-  LockGuard lock(cache_mu_);
-  std::memcpy(out, installLoaded(id, std::move(buf)).data.data(), kPageSize);
+  loadFromDisk(id, buf.data());  // without the shard lock, as in visit()
+  LockGuard lock(sh.mu);
+  std::memcpy(out, installLoaded(sh, id, std::move(buf)).data.data(), kPageSize);
 }
 
 void Pager::write(PageId id, const char* in) {
   if (id == kInvalidPage || id >= meta_.page_count) {
     throw Error("write of out-of-range page " + std::to_string(id));
   }
-  LockGuard lock(cache_mu_);
-  Frame& f = frame(id, false);
+  Shard& sh = shardOf(id);
+  LockGuard lock(sh.mu);
+  Frame& f = frame(sh, id, false);
   std::memcpy(f.data.data(), in, kPageSize);
   if (!f.dirty) {
     f.dirty = true;
-    dirty_count_++;
-    hold(f);
+    sh.dirty++;
+    hold(sh, f);
   }
 }
 
@@ -243,18 +243,37 @@ void Pager::free(PageId id) {
 }
 
 size_t Pager::dirtyCount() {
-  LockGuard lock(cache_mu_);
-  return dirty_count_;
+  size_t n = 0;
+  for (auto& sh : shards_) {
+    LockGuard lock(sh->mu);
+    n += sh->dirty;
+  }
+  return n;
 }
 
 size_t Pager::cachedCount() {
-  LockGuard lock(cache_mu_);
-  return frames_.size();
+  size_t n = 0;
+  for (auto& sh : shards_) {
+    LockGuard lock(sh->mu);
+    n += sh->frames.size();
+  }
+  return n;
 }
 
 PagerStats Pager::stats() {
-  LockGuard lock(cache_mu_);
-  return stats_;
+  PagerStats s;
+  {
+    LockGuard lock(stats_mu_);
+    s = stats_;
+  }
+  s.cache_hits = 0;
+  s.cache_misses = 0;
+  for (auto& sh : shards_) {
+    LockGuard lock(sh->mu);
+    s.cache_hits += sh->hits;
+    s.cache_misses += sh->misses;
+  }
+  return s;
 }
 
 CheckpointSnapshot Pager::beginCheckpoint(Lsn lsn) {
@@ -264,20 +283,24 @@ CheckpointSnapshot Pager::beginCheckpoint(Lsn lsn) {
   snap.meta_page.resize(kPageSize);
   encodeMeta(snap.meta_page.data());
 
-  LockGuard lock(cache_mu_);
-  for (auto& kv : frames_) {
-    if (kv.second.dirty) snap.ids.push_back(kv.first);
+  for (auto& sh : shards_) {
+    LockGuard lock(sh->mu);
+    for (auto& kv : sh->frames) {
+      if (kv.second.dirty) snap.ids.push_back(kv.first);
+    }
   }
   std::sort(snap.ids.begin(), snap.ids.end());
   snap.pages.reserve(snap.ids.size());
   for (PageId id : snap.ids) {
-    Frame& f = frames_[id];
+    Shard& sh = shardOf(id);
+    LockGuard lock(sh.mu);
+    Frame& f = sh.frames[id];
     stampChecksum(f.data.data());
     snap.pages.push_back(f.data);
     f.dirty = false;  // a later write re-dirties it for the next checkpoint
     f.pins++;
+    sh.dirty--;
   }
-  dirty_count_ = 0;
   return snap;
 }
 
@@ -320,22 +343,26 @@ void Pager::writeCheckpoint(const CheckpointSnapshot& snap) {
   dwb_.truncate(0);
   dwb_.sync();
 
-  LockGuard lock(cache_mu_);
+  LockGuard lock(stats_mu_);
   stats_.pages_flushed += count;
   stats_.checkpoints++;
   is_new_ = false;
 }
 
 void Pager::endCheckpoint(const CheckpointSnapshot& snap) {
-  LockGuard lock(cache_mu_);
   for (PageId id : snap.ids) {
-    auto it = frames_.find(id);
-    if (it != frames_.end() && it->second.pins > 0) {
+    Shard& sh = shardOf(id);
+    LockGuard lock(sh.mu);
+    auto it = sh.frames.find(id);
+    if (it != sh.frames.end() && it->second.pins > 0) {
       it->second.pins--;
-      release(it->second);  // written out: evictable again unless re-dirtied
+      release(sh, it->second);  // written out: evictable again unless re-dirtied
     }
   }
-  evictIfNeeded(kInvalidPage);
+  for (auto& sh : shards_) {
+    LockGuard lock(sh->mu);
+    evictIfNeeded(*sh, kInvalidPage);
+  }
 }
 
 void Pager::checkpoint(Lsn lsn) {
