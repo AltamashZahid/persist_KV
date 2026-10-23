@@ -210,7 +210,7 @@ void DB::writeGroup(const std::vector<Writer*>& group, bool* want_checkpoint, bo
 
   size_t dirty = pager_.dirtyCount();
   *want_checkpoint = wal.size() >= options_.checkpoint_wal_bytes || dirty >= options_.checkpoint_dirty_pages;
-  *must_wait = wal.size() >= 4 * options_.checkpoint_wal_bytes || dirty >= 4 * options_.checkpoint_dirty_pages;
+  *must_wait = wal.size() >= 2 * options_.checkpoint_wal_bytes || dirty >= 2 * options_.checkpoint_dirty_pages;
 }
 
 void DB::put(const std::string& key, const std::string& value) {

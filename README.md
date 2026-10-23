@@ -194,7 +194,7 @@ Only splits, merges and values stored in overflow pages take the general path (3
 faster random puts and 7.6× faster batched puts than before this was added).
 
 With 200K keys, the data is larger than the page cache, so many operations read from
-disk: puts fall to 17,500 ops/s, gets to 21,600 ops/s and deletes to 5,700 ops/s.
+disk: puts fall to 49,800 ops/s, gets to 19,100 ops/s and deletes to 8,100 ops/s.
 The integrity check still passes after every run.
 
 Durable-write numbers depend mostly on how long the disk takes to fsync, so they vary

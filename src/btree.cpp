@@ -549,37 +549,40 @@ size_t BTree::mergeIntoLeaf(PageId id, const PutItem* items, size_t n, size_t* i
     auto entryEnd = [&](size_t i) { return i + 1 < count ? slotAt(page, id, kPageHeaderSize, i + 1) : end; };
     auto oldKey = [&](size_t i, uint16_t* len) { return keyAt(page, id, kPageHeaderSize, i, len); };
 
-    // Pass 1: how many items fit, and which old entries they replace.
+    // Pass 1: how many items fit, where each one goes (a binary search that
+    // starts after the previous item), and which old entries they replace.
     size_t body = end - kPageHeaderSize;
     size_t oi = 0, replaced = 0;
+    spots_.clear();
     for (; taken < n; taken++) {
       const std::string& key = *items[taken].key;
-      while (oi < count) {
+      size_t lo = oi, hi = count;
+      while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
         uint16_t len;
-        const char* k = oldKey(oi, &len);
-        if (key.compare(0, key.size(), k, len) <= 0) break;
-        oi++;
+        const char* k = oldKey(mid, &len);
+        if (key.compare(0, key.size(), k, len) <= 0) hi = mid;
+        else lo = mid + 1;
       }
       bool found = false;
       size_t old_size = 0;
-      if (oi < count) {
+      if (lo < count) {
         uint16_t len;
-        const char* k = oldKey(oi, &len);
+        const char* k = oldKey(lo, &len);
         if (key.compare(0, key.size(), k, len) == 0) {
-          Reader r{page, id, slotAt(page, id, kPageHeaderSize, oi) + 2 + len};
+          Reader r{page, id, slotAt(page, id, kPageHeaderSize, lo) + 2 + len};
           size_t clen;
           if (static_cast<uint8_t>(r.cell(&clen)[0]) != kCellInline) break;  // its overflow chain must be freed
           found = true;
-          old_size = entryEnd(oi) - slotAt(page, id, kPageHeaderSize, oi);
+          old_size = entryEnd(lo) - slotAt(page, id, kPageHeaderSize, lo);
         }
       }
       size_t grown = body - old_size + (2 + key.size() + 3 + items[taken].value->size()) + (found ? 0 : 2);
       if (grown > kNodeCapacity) break;  // needs a split
       body = grown;
-      if (found) {
-        replaced++;
-        oi++;
-      }
+      spots_.push_back({lo, found});
+      if (found) replaced++;
+      oi = found ? lo + 1 : lo;
     }
     if (taken == 0) return;
     if (body < kNodeMinFill && id != pager_.meta().root) {  // smaller values left it underfull: rebalance
@@ -592,29 +595,25 @@ size_t BTree::mergeIntoLeaf(PageId id, const PutItem* items, size_t n, size_t* i
     std::memcpy(out, page, kPageHeaderSize);
     put16(out + kOffNumKeys, static_cast<uint16_t>(new_count));
     size_t off = kPageHeaderSize + 2 * new_count, slot = 0;
-    auto copyOld = [&](size_t i) {
-      size_t from = slotAt(page, id, kPageHeaderSize, i), len = entryEnd(i) - from;
-      put16(out + kPageHeaderSize + 2 * slot++, static_cast<uint16_t>(off));
-      std::memcpy(out + off, page + from, len);
-      off += len;
+    // Copies old entries [from, to) as one block (they are contiguous) and
+    // writes their shifted slots.
+    auto copyRun = [&](size_t from, size_t to) {
+      if (from >= to) return;
+      size_t a = slotAt(page, id, kPageHeaderSize, from), b = entryEnd(to - 1);
+      std::memcpy(out + off, page + a, b - a);
+      for (size_t i = from; i < to; i++) {
+        put16(out + kPageHeaderSize + 2 * slot++, static_cast<uint16_t>(slotAt(page, id, kPageHeaderSize, i) - a + off));
+      }
+      off += b - a;
     };
     oi = 0;
     for (size_t t = 0; t < taken; t++) {
       const std::string& key = *items[t].key;
       const std::string& value = *items[t].value;
-      bool found = false;
-      while (oi < count) {
-        uint16_t len;
-        const char* k = oldKey(oi, &len);
-        int c = key.compare(0, key.size(), k, len);
-        if (c < 0) break;
-        if (c == 0) {
-          found = true;
-          oi++;  // replaced
-          break;
-        }
-        copyOld(oi++);
-      }
+      size_t at = spots_[t].first;
+      bool found = spots_[t].second;
+      copyRun(oi, at);
+      oi = found ? at + 1 : at;  // a replaced entry is skipped
       put16(out + kPageHeaderSize + 2 * slot++, static_cast<uint16_t>(off));
       put16(out + off, static_cast<uint16_t>(key.size()));
       std::memcpy(out + off + 2, key.data(), key.size());
@@ -624,7 +623,7 @@ size_t BTree::mergeIntoLeaf(PageId id, const PutItem* items, size_t n, size_t* i
       off += 2 + key.size() + 3 + value.size();
       if (!found) ++*inserted;
     }
-    while (oi < count) copyOld(oi++);
+    copyRun(oi, count);
     std::memset(out + off, 0, kPageSize - off);
   });
   if (taken == 0) return 0;

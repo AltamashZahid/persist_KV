@@ -415,7 +415,15 @@ tampering.
 ### Why checkpoint?
 Without checkpoints the WAL grows forever and recovery replays all of history. A
 checkpoint writes the dirty pages into the data file, after which the log can be
-emptied. One is triggered when the WAL reaches 8 MB or 2,048 pages are dirty.
+emptied. One is triggered when the WAL reaches 32 MB or 8,192 pages (32 MB) are dirty.
+
+How often to checkpoint is a trade-off. Each checkpoint rewrites every page dirtied
+since the previous one (twice, with the doublewrite buffer below), so writes that land
+on random pages, like secondary-index entries, get cheaper the rarer checkpoints are.
+Loading 1M events with an index on `user_id` took 15.7 s with 8 MB / 2,048-page
+thresholds (75 checkpoints writing ~1.4 GB for a 75 MB file) and 4.5 s with the
+current ones (4 checkpoints). The costs are memory, because dirty pages stay cached
+until a checkpoint, and recovery time, because a larger WAL takes longer to replay.
 
 ### The torn-page problem, and the doublewrite buffer
 A checkpoint writes many pages. If power fails midway, the data file is a mix of old

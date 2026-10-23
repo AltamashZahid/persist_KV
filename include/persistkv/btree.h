@@ -120,6 +120,7 @@ class BTree {
   size_t mergeIntoLeaf(PageId id, const PutItem* items, size_t n, size_t* inserted);
   size_t splitLeafWith(const std::vector<PathStep>& path, PageId id, bool rightmost, const PutItem* items, size_t n);
   PageId leafFor(const std::string& key, std::string* fence, bool* has_fence, std::vector<PathStep>* path = nullptr);
+  std::vector<std::pair<size_t, bool>> spots_;  // mergeIntoLeaf scratch: (position, replaces) per item
   bool modify(PageId id, Mutation& m, Node* out, bool rightmost);
   void fixChild(Node& parent, size_t idx, Node& child, bool append);
   void splitNode(Node& n, Node& right, std::string* separator, bool append = false);

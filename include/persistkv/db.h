@@ -21,9 +21,13 @@ struct Options {
   bool sync_writes = true;
   size_t cache_pages = 4096;
   // A checkpoint is triggered when either threshold is crossed. Writers
-  // block (backpressure) if the backlog reaches 4x the threshold.
-  uint64_t checkpoint_wal_bytes = 8ull << 20;
-  size_t checkpoint_dirty_pages = 2048;
+  // block (backpressure) if the backlog reaches 2x the threshold. Dirty
+  // pages stay cached until a checkpoint, so the cache can grow by up to
+  // 2 x checkpoint_dirty_pages pages (64 MB by default). Checkpointing
+  // rarely matters for writes that land on random pages (secondary
+  // indexes): every checkpoint rewrites each page dirtied since the last.
+  uint64_t checkpoint_wal_bytes = 32ull << 20;
+  size_t checkpoint_dirty_pages = 8192;
   // Run checkpoints on a background thread so writers do not wait for the
   // checkpoint's disk I/O. When false, the writer that crosses a threshold
   // runs the checkpoint itself.
