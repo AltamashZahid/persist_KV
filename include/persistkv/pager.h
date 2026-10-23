@@ -117,8 +117,12 @@ class Pager {
     std::vector<char> data;
     bool dirty = false;
     int pins = 0;  // > 0 while a checkpoint is writing this page out
+    bool held = false;  // in held_ (dirty or pinned) rather than lru_
     std::list<PageId>::iterator lru;
   };
+
+  void hold(Frame& f);     // dirty or pinned: out of the eviction list
+  void release(Frame& f);  // clean and unpinned again: back into it
 
   Frame& frame(PageId id, bool load_from_disk);  // cache_mu_ must be held
   void loadFromDisk(PageId id, char* out);
@@ -140,7 +144,11 @@ class Pager {
   // Page ids are dense (1..page_count), so cached frames are found by
   // indexing this array instead of hashing; nullptr = not cached.
   std::vector<Frame*> table_;
-  std::list<PageId> lru_;  // front = most recently used
+  // Clean, unpinned pages, front = most recently used: every page here can
+  // be evicted. Dirty and pinned pages wait in held_ until a checkpoint has
+  // written them, so eviction never walks past pages it cannot drop.
+  std::list<PageId> lru_;
+  std::list<PageId> held_;
   size_t dirty_count_ = 0;
   PagerStats stats_;
 };

@@ -124,7 +124,7 @@ Pager::Frame& Pager::frame(PageId id, bool load_from_disk) {
   if (id < table_.size() && table_[id]) {
     Frame& f = *table_[id];
     stats_.cache_hits++;
-    if (f.lru != lru_.begin()) lru_.splice(lru_.begin(), lru_, f.lru);
+    if (!f.held && f.lru != lru_.begin()) lru_.splice(lru_.begin(), lru_, f.lru);
     return f;
   }
   Frame f;
@@ -143,19 +143,30 @@ Pager::Frame& Pager::frame(PageId id, bool load_from_disk) {
 }
 
 void Pager::evictIfNeeded(PageId keep) {
-  // Walk from the cold end and drop clean, unpinned pages. Dirty pages
-  // cannot be evicted (the data file may only change during a checkpoint),
-  // so the cache can temporarily grow past capacity until the next one.
-  auto it = lru_.end();
-  while (frames_.size() > capacity_ && it != lru_.begin()) {
-    --it;
-    if (*it == keep) continue;
-    auto f = frames_.find(*it);
-    if (f->second.dirty || f->second.pins > 0) continue;
-    table_[*it] = nullptr;
-    frames_.erase(f);
-    it = lru_.erase(it);
+  // Drop clean pages from the cold end. Dirty pages cannot be evicted (the
+  // data file may only change during a checkpoint), so the cache can
+  // temporarily grow past capacity until the next one. They are not in lru_
+  // at all, so this never walks past them: it used to, and with the cache
+  // full of dirty pages after a bulk load every miss scanned all of them.
+  while (frames_.size() > capacity_ && !lru_.empty()) {
+    PageId id = lru_.back();
+    if (id == keep) break;
+    table_[id] = nullptr;
+    frames_.erase(id);
+    lru_.pop_back();
   }
+}
+
+void Pager::hold(Frame& f) {
+  if (f.held) return;
+  held_.splice(held_.begin(), lru_, f.lru);
+  f.held = true;
+}
+
+void Pager::release(Frame& f) {
+  if (!f.held || f.dirty || f.pins > 0) return;
+  lru_.splice(lru_.begin(), held_, f.lru);
+  f.held = false;
 }
 
 void Pager::read(PageId id, char* out) {
@@ -176,6 +187,7 @@ void Pager::write(PageId id, const char* in) {
   if (!f.dirty) {
     f.dirty = true;
     dirty_count_++;
+    hold(f);
   }
 }
 
@@ -287,7 +299,10 @@ void Pager::endCheckpoint(const CheckpointSnapshot& snap) {
   LockGuard lock(cache_mu_);
   for (PageId id : snap.ids) {
     auto it = frames_.find(id);
-    if (it != frames_.end() && it->second.pins > 0) it->second.pins--;
+    if (it != frames_.end() && it->second.pins > 0) {
+      it->second.pins--;
+      release(it->second);  // written out: evictable again unless re-dirtied
+    }
   }
   evictIfNeeded(kInvalidPage);
 }

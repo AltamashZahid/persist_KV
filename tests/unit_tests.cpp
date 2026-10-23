@@ -234,6 +234,26 @@ TEST(range_scan_matches_std_map) {
   CHECK(seen == 10);
 }
 
+TEST(cache_stays_bounded_once_pages_are_clean) {
+  // Dirty pages may push the cache past its capacity until a checkpoint;
+  // afterwards reads must evict back down to it.
+  Options o = fastOptions();
+  o.cache_pages = 64;
+  o.checkpoint_dirty_pages = 1u << 30;  // only the explicit checkpoint below
+  o.checkpoint_wal_bytes = 1ull << 40;
+  DB db(freshDir("bounded_cache"), o);
+  std::mt19937 rng(3);
+  WriteBatch batch;
+  for (int i = 0; i < 20000; i++) batch.put(key(static_cast<int>(rng() % 100000)), value(i % 50));
+  db.write(batch);
+  CHECK(db.stats().cached_pages > 64);  // all dirty, nothing evictable yet
+  db.checkpoint();
+  std::string v;
+  for (int i = 0; i < 100000; i += 7) db.get(key(i), &v);  // touches every page
+  CHECK(db.stats().cached_pages <= 64);
+  CHECK_HEALTHY(db);
+}
+
 TEST(raw_get_matches_get) {
   Options o = fastOptions();
   o.cache_pages = 32;  // exercise evictions with the array page table
