@@ -485,6 +485,62 @@ void BTree::scanRaw(const std::string& lo, const std::string* hi, const RawScanF
   }
 }
 
+// Walks down level by level, keeping the nodes whose key ranges overlap
+// [lo, hi), until their separators inside the range are enough to cut it
+// into `parts` pieces (or the next level would be leaves). Separators are
+// spread evenly over the subtrees, so pieces cover similar page counts.
+std::vector<std::string> BTree::splitPoints(const std::string& lo, const std::string& hi, size_t parts) {
+  std::vector<std::string> seps;
+  if (parts < 2) return seps;
+  auto inside = [&](const char* k, uint16_t len) {
+    return lo.compare(0, lo.size(), k, len) < 0 && (hi.empty() || hi.compare(0, hi.size(), k, len) > 0);
+  };
+  char page[kPageSize];
+  std::vector<PageId> level{pager_.meta().root};
+  while (true) {
+    std::vector<PageId> next;
+    seps.clear();
+    bool leaves_below = false;
+    for (PageId id : level) {
+      pager_.read(id, page);
+      if (isLeafPage(page, id)) return seps;  // the root is a leaf: one piece
+      size_t count = keyCount(page, id, false);
+      size_t base = slotBase(false, count);
+      for (size_t i = 0; i <= count; i++) {
+        // Child i holds keys in [sep[i-1], sep[i]); keep it if that overlaps [lo, hi).
+        bool before_hi = true, after_lo = true;
+        if (i > 0) {
+          uint16_t len;
+          const char* k = keyAt(page, id, base, i - 1, &len);
+          before_hi = hi.empty() || hi.compare(0, hi.size(), k, len) > 0;
+          if (inside(k, len)) seps.emplace_back(k, len);
+        }
+        if (i < count) {
+          uint16_t len;
+          const char* k = keyAt(page, id, base, i, &len);
+          after_lo = lo.compare(0, lo.size(), k, len) < 0;
+        }
+        if (before_hi && after_lo) next.push_back(get32(page + kPageHeaderSize + 4 * i));
+      }
+      if (!next.empty() && !leaves_below) {
+        char child[kPageSize];
+        pager_.read(next.back(), child);
+        leaves_below = isLeafPage(child, next.back());
+      }
+    }
+    if (seps.size() + 1 >= parts || leaves_below || next.empty()) break;
+    level = std::move(next);
+  }
+  // Keep parts - 1 of them, evenly spaced.
+  if (seps.size() + 1 > parts) {
+    std::vector<std::string> picked;
+    for (size_t p = 1; p < parts; p++) picked.push_back(seps[p * seps.size() / parts]);
+    picked.erase(std::unique(picked.begin(), picked.end()), picked.end());
+    seps = std::move(picked);
+  }
+  return seps;
+}
+
 // Leaves link only forward, so a reverse scan re-descends for each leaf:
 // to the leaf holding the largest key below `bound`, noting the separator
 // just left of the path (every key in that leaf is >= it). After the leaf is

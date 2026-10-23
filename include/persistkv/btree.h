@@ -90,6 +90,10 @@ class BTree {
   // Keys in [lo, *hi) (no upper bound when hi is null) in descending order,
   // until fn returns false.
   void scanRawReverse(const std::string* hi, const std::string& lo, const RawScanFn& fn);
+  // Up to parts - 1 keys inside (lo, hi) (hi empty = unbounded) that split
+  // the range into pieces of roughly equal page counts, taken from the
+  // separators of the upper tree levels, in ascending order.
+  std::vector<std::string> splitPoints(const std::string& lo, const std::string& hi, size_t parts);
 
   uint32_t height();
 

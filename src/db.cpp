@@ -273,6 +273,12 @@ void DB::scan(const std::string& lo, const std::string& hi, const ScanFn& fn) {
   tree_.scan(lo, hi.empty() ? nullptr : &hi, fn);
 }
 
+std::vector<std::string> DB::splitPoints(const std::string& lo, const std::string& hi, size_t parts) {
+  ensureUsable();
+  SharedLock lock(tree_mu_);
+  return tree_.splitPoints(lo, hi, parts);
+}
+
 void DB::scanRawReverse(const std::string& lo, const std::string& hi_exclusive, const RawScanFn& fn) {
   ensureUsable();
   SharedLock lock(tree_mu_);

@@ -255,6 +255,40 @@ TEST(cache_stays_bounded_once_pages_are_clean) {
   CHECK_HEALTHY(db);
 }
 
+TEST(split_points_cut_ranges_evenly) {
+  DB db(freshDir("split_points"), fastOptions());
+  WriteBatch batch;
+  for (int i = 0; i < 60000; i++) batch.put(key(i), value(i % 50));
+  db.write(batch);
+  // Whole key space, and a sub-range: points are inside, ascending, and the
+  // pieces they make hold similar numbers of keys.
+  std::vector<std::pair<std::string, std::string>> ranges = {{"", ""}, {key(10000), key(30000)}};
+  for (const auto& r : ranges) {
+    std::vector<std::string> pts = db.splitPoints(r.first, r.second, 8);
+    CHECK(pts.size() >= 4 && pts.size() <= 7);
+    CHECK(std::is_sorted(pts.begin(), pts.end()));
+    for (const std::string& p : pts) CHECK(p > r.first && (r.second.empty() || p < r.second));
+    std::vector<std::string> bounds = {r.first};
+    bounds.insert(bounds.end(), pts.begin(), pts.end());
+    bounds.push_back(r.second);
+    size_t total = 0, biggest = 0;
+    for (size_t i = 0; i + 1 < bounds.size(); i++) {
+      size_t n = 0;
+      db.scanRaw(bounds[i], "", [&](const char* k, size_t kl, const char*, size_t) {
+        if (!bounds[i + 1].empty() && bounds[i + 1].compare(0, bounds[i + 1].size(), k, kl) <= 0) return false;
+        n++;
+        return true;
+      });
+      total += n;
+      biggest = std::max(biggest, n);
+    }
+    size_t expect = r.second.empty() ? 60000 : 20000;
+    CHECK(total == expect);
+    CHECK(biggest < expect / pts.size() * 2);  // no piece much bigger than its share
+  }
+  CHECK(db.splitPoints(key(5), key(6), 8).empty());  // a tiny range: one piece
+}
+
 TEST(reverse_scan_matches_forward_scan) {
   Options o = fastOptions();
   o.cache_pages = 32;

@@ -113,6 +113,10 @@ class DB {
   // Like scanRaw, but newest-first: keys >= lo and < hi_exclusive (empty =
   // no upper bound), in descending order, until fn returns false.
   void scanRawReverse(const std::string& lo, const std::string& hi_exclusive, const RawScanFn& fn);
+  // Keys that split [lo, hi) (hi empty = unbounded) into about `parts` pieces
+  // of similar size, for scanning them in parallel. Cheap: reads only the
+  // tree's upper levels. May return fewer (a small range has few pages).
+  std::vector<std::string> splitPoints(const std::string& lo, const std::string& hi, size_t parts);
 
   void checkpoint();  // synchronous
   uint64_t size();
