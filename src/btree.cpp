@@ -391,6 +391,59 @@ bool BTree::getRaw(const std::string& key, const RawValueFn& fn) {
   return found;
 }
 
+void BTree::multiGetRaw(const std::vector<std::string>& keys, const MultiValueFn& fn) {
+  PageId leaf = kInvalidPage;  // the leaf that held (or would hold) the previous key
+  std::string overflow_cell;
+  for (size_t ki = 0; ki < keys.size(); ki++) {
+    const std::string& key = keys[ki];
+    // Searches `leaf` for key. With `reuse`, a key past the leaf's last key is
+    // left unresolved: it may belong to a later leaf. Keys are ascending, so
+    // a key no greater than the leaf's last key is inside the leaf's range.
+    auto search = [&](bool reuse) {
+      bool resolved = false;
+      pager_.visit(leaf, [&](const char* page) {
+        size_t count = keyCount(page, leaf, true);
+        size_t i = leafLowerBound(page, leaf, count, key);
+        if (i == count) {
+          resolved = !reuse;
+          return;
+        }
+        resolved = true;
+        Reader r{page, leaf, slotAt(page, leaf, kPageHeaderSize, i)};
+        uint16_t klen = r.u16();
+        const char* k = r.bytes(klen);
+        if (key.compare(0, key.size(), k, klen) != 0) return;
+        size_t clen;
+        const char* c = r.cell(&clen);
+        if (static_cast<uint8_t>(c[0]) == kCellInline) fn(ki, c + 3, get16(c + 1));
+        else overflow_cell.assign(c, clen);
+      });
+      return resolved;
+    };
+    if (leaf == kInvalidPage || !search(true)) {
+      PageId id = pager_.meta().root;
+      while (true) {
+        bool is_leaf = false;
+        PageId child = kInvalidPage;
+        pager_.visit(id, [&](const char* page) {
+          is_leaf = isLeafPage(page, id);
+          if (!is_leaf) child = rawChildFor(page, id, key);
+        });
+        if (is_leaf) break;
+        id = child;
+      }
+      leaf = id;
+      search(false);
+    }
+    if (!overflow_cell.empty()) {
+      std::string value;
+      readCell(overflow_cell, &value);
+      fn(ki, value.data(), value.size());
+      overflow_cell.clear();
+    }
+  }
+}
+
 void BTree::scan(const std::string& lo, const std::string* hi, const ScanFn& fn) {
   char page[kPageSize];
   PageId id = pager_.meta().root;

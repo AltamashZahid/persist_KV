@@ -236,6 +236,37 @@ TEST(raw_get_matches_get) {
   CHECK_HEALTHY(db);
 }
 
+TEST(multi_get_matches_get) {
+  Options o = fastOptions();
+  o.cache_pages = 32;
+  DB db(freshDir("multi_get"), o);
+  std::mt19937 rng(11);
+  for (int i = 0; i < 3000; i++) {
+    db.put(key(rng() % 4000), std::string(rng() % 10 == 0 ? 600 + rng() % 3000 : rng() % 80, 'a' + i % 26));
+  }
+  for (int round = 0; round < 20; round++) {
+    // Sorted batches with gaps, runs, duplicates and keys past the end.
+    std::vector<std::string> keys;
+    size_t n = 1 + rng() % 600;
+    for (size_t i = 0; i < n; i++) keys.push_back(key(rng() % (round % 2 ? 4500 : 300)));
+    std::sort(keys.begin(), keys.end());
+    std::vector<std::string> got(keys.size());
+    std::vector<bool> seen(keys.size(), false);
+    db.multiGetRaw(keys, [&](size_t i, const char* v, size_t len) {
+      CHECK(!seen[i]);
+      seen[i] = true;
+      got[i].assign(v, len);
+    });
+    for (size_t i = 0; i < keys.size(); i++) {
+      std::string want;
+      bool has = db.get(keys[i], &want);
+      CHECK(has == seen[i] && got[i] == want);
+    }
+  }
+  db.multiGetRaw({}, [&](size_t, const char*, size_t) { CHECK(false); });
+  CHECK_HEALTHY(db);
+}
+
 TEST(raw_scan_matches_scan) {
   DB db(freshDir("raw_scan"), fastOptions());
   std::mt19937 rng(3);

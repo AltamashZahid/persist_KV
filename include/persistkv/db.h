@@ -89,6 +89,10 @@ class DB {
   // Zero-copy get: fn receives the value bytes, valid only during the call
   // (do not call DB methods from inside it). Returns whether the key exists.
   bool getRaw(const std::string& key, const RawValueFn& fn);
+  // getRaw for a batch of keys sorted ascending: fn(i, value, len) runs for
+  // each sorted_keys[i] that exists. Much cheaper than separate gets when
+  // keys are close together. The read lock is held for the whole batch.
+  void multiGetRaw(const std::vector<std::string>& sorted_keys, const MultiValueFn& fn);
   bool remove(const std::string& key);  // whether the key existed when called
 
   // Applies every operation in the batch atomically, with one fsync.

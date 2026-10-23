@@ -226,6 +226,13 @@ void DB::write(const WriteBatch& batch) {
 // Reads
 // ---------------------------------------------------------------------------
 
+void DB::multiGetRaw(const std::vector<std::string>& sorted_keys, const MultiValueFn& fn) {
+  for (const std::string& key : sorted_keys) validate(key, nullptr);
+  ensureUsable();
+  SharedLock lock(tree_mu_);
+  tree_.multiGetRaw(sorted_keys, fn);
+}
+
 bool DB::getRaw(const std::string& key, const RawValueFn& fn) {
   validate(key, nullptr);
   ensureUsable();

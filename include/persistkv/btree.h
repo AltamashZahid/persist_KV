@@ -53,6 +53,10 @@ using RawScanFn = std::function<bool(const char* key, size_t key_len, const char
 // Zero-copy point-lookup callback: the value bytes are only valid during the call.
 using RawValueFn = std::function<void(const char* value, size_t value_len)>;
 
+// Batched-lookup callback: called once per key that exists, with that key's
+// position in the batch. The value bytes are only valid during the call.
+using MultiValueFn = std::function<void(size_t index, const char* value, size_t value_len)>;
+
 class BTree {
  public:
   explicit BTree(Pager& pager) : pager_(pager) {}
@@ -62,6 +66,9 @@ class BTree {
   bool get(const std::string& key, std::string* value);
   // Like get, but hands the value to fn in place instead of copying it.
   bool getRaw(const std::string& key, const RawValueFn& fn);
+  // getRaw for many keys in ascending order: consecutive keys that fall in
+  // the same leaf are found there without descending from the root again.
+  void multiGetRaw(const std::vector<std::string>& sorted_keys, const MultiValueFn& fn);
   bool put(const std::string& key, const std::string& value);  // true if key was new
   bool remove(const std::string& key);                         // true if key existed
 
