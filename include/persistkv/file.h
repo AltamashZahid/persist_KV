@@ -35,7 +35,6 @@ class File {
   int fd_ = -1;
   std::string path_;
 #ifdef _WIN32
-  Mutex io_mu_;  // seek and read/write are separate calls on Windows
 #endif
 };
 

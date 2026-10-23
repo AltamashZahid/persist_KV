@@ -255,6 +255,52 @@ TEST(cache_stays_bounded_once_pages_are_clean) {
   CHECK_HEALTHY(db);
 }
 
+TEST(parallel_scans_with_cache_misses_and_checkpoints) {
+  // Eight threads scan the pieces of a range at once through a tiny cache
+  // (nearly every page is a miss, read without the cache lock), while a
+  // writer adds other keys and checkpoints run in the background.
+  Options o = fastOptions();
+  o.cache_pages = 32;
+  o.checkpoint_dirty_pages = 24;
+  o.checkpoint_wal_bytes = 64 * 1024;
+  DB db(freshDir("parallel_scans"), o);
+  WriteBatch batch;
+  for (int i = 0; i < 40000; i++) batch.put("a" + key(i), value(i % 50));
+  db.write(batch);
+  std::vector<std::string> bounds = {"a"};
+  for (const std::string& p : db.splitPoints("a", "b", 8)) bounds.push_back(p);
+  bounds.push_back("b");
+  std::atomic<int> errors(0);
+  std::atomic<long> seen(0);
+  std::atomic<bool> stop(false);
+  Thread writer;
+  writer.start([&] {
+    for (int i = 0; !stop && i < 20000; i++) db.put("c" + key(i), value(i % 50));
+  });
+  for (int round = 0; round < 3; round++) {
+    std::vector<std::unique_ptr<Thread>> scanners;
+    for (size_t piece = 0; piece + 1 < bounds.size(); piece++) {
+      scanners.emplace_back(new Thread());
+      scanners.back()->start([&, piece] {
+        const std::string& hi = bounds[piece + 1];
+        db.scanRaw(bounds[piece], "", [&](const char* k, size_t kl, const char* v, size_t vl) {
+          if (hi.compare(0, hi.size(), k, kl) <= 0) return false;
+          int i = std::stoi(std::string(k + 1, kl - 1).substr(3));  // "a" + "key%08d"
+          if (std::string(v, vl) != value(i % 50)) errors++;
+          seen++;
+          return true;
+        });
+      });
+    }
+    for (auto& t : scanners) t->join();
+  }
+  stop = true;
+  writer.join();
+  CHECK(errors == 0);
+  CHECK(seen == 3 * 40000);
+  CHECK_HEALTHY(db);
+}
+
 TEST(split_points_cut_ranges_evenly) {
   DB db(freshDir("split_points"), fastOptions());
   WriteBatch batch;

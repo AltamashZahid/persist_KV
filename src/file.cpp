@@ -7,6 +7,7 @@
 #include "persistkv/common.h"
 
 #ifdef _WIN32
+#include <windows.h>
 #include <direct.h>
 #include <fcntl.h>
 #include <io.h>
@@ -55,13 +56,22 @@ size_t File::readAt(uint64_t offset, void* buf, size_t n) {
   char* p = static_cast<char*>(buf);
   size_t done = 0;
 #ifdef _WIN32
-  LockGuard lock(io_mu_);
-  if (::_lseeki64(fd_, static_cast<__int64>(offset), SEEK_SET) < 0) ioFail("seek", path_);
+  // ReadFile with an explicit offset is a positional read (like pread), so
+  // concurrent readers need no lock and do not disturb each other.
+  HANDLE h = reinterpret_cast<HANDLE>(::_get_osfhandle(fd_));
   while (done < n) {
-    int r = ::_read(fd_, p + done, static_cast<unsigned>(n - done));
-    if (r < 0) ioFail("read", path_);
-    if (r == 0) break;
-    done += static_cast<size_t>(r);
+    uint64_t at = offset + done;
+    OVERLAPPED ov;
+    std::memset(&ov, 0, sizeof ov);
+    ov.Offset = static_cast<DWORD>(at & 0xFFFFFFFFu);
+    ov.OffsetHigh = static_cast<DWORD>(at >> 32);
+    DWORD got = 0;
+    if (!::ReadFile(h, p + done, static_cast<DWORD>(n - done), &got, &ov)) {
+      if (::GetLastError() == ERROR_HANDLE_EOF) break;
+      ioFail("read", path_);
+    }
+    if (got == 0) break;
+    done += got;
   }
 #else
   while (done < n) {
@@ -81,12 +91,18 @@ void File::writeAt(uint64_t offset, const void* buf, size_t n) {
   const char* p = static_cast<const char*>(buf);
   size_t done = 0;
 #ifdef _WIN32
-  LockGuard lock(io_mu_);
-  if (::_lseeki64(fd_, static_cast<__int64>(offset), SEEK_SET) < 0) ioFail("seek", path_);
+  // Positional, like pwrite: no shared file pointer that a concurrent read
+  // could move between a seek and the write.
+  HANDLE h = reinterpret_cast<HANDLE>(::_get_osfhandle(fd_));
   while (done < n) {
-    int r = ::_write(fd_, p + done, static_cast<unsigned>(n - done));
-    if (r <= 0) ioFail("write", path_);
-    done += static_cast<size_t>(r);
+    uint64_t at = offset + done;
+    OVERLAPPED ov;
+    std::memset(&ov, 0, sizeof ov);
+    ov.Offset = static_cast<DWORD>(at & 0xFFFFFFFFu);
+    ov.OffsetHigh = static_cast<DWORD>(at >> 32);
+    DWORD put = 0;
+    if (!::WriteFile(h, p + done, static_cast<DWORD>(n - done), &put, &ov) || put == 0) ioFail("write", path_);
+    done += put;
   }
 #else
   while (done < n) {
@@ -118,9 +134,8 @@ void File::truncate(uint64_t size) {
 
 uint64_t File::size() {
 #ifdef _WIN32
-  LockGuard lock(io_mu_);
-  __int64 end = ::_lseeki64(fd_, 0, SEEK_END);
-  if (end < 0) ioFail("seek", path_);
+  __int64 end = ::_filelengthi64(fd_);  // does not move the file pointer
+  if (end < 0) ioFail("stat", path_);
   return static_cast<uint64_t>(end);
 #else
   struct stat st;

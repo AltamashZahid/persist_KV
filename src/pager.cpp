@@ -120,6 +120,28 @@ void Pager::loadFromDisk(PageId id, char* out) {
   if (!verifyChecksum(out)) throw CorruptionError("checksum mismatch on page " + std::to_string(id));
 }
 
+Pager::Frame* Pager::cachedFrame(PageId id) {
+  if (id >= table_.size() || !table_[id]) return nullptr;
+  Frame& f = *table_[id];
+  stats_.cache_hits++;
+  if (!f.held && f.lru != lru_.begin()) lru_.splice(lru_.begin(), lru_, f.lru);
+  return &f;
+}
+
+Pager::Frame& Pager::installLoaded(PageId id, std::vector<char> data) {
+  if (Frame* f = cachedFrame(id)) return *f;
+  stats_.cache_misses++;
+  Frame f;
+  f.data = std::move(data);
+  lru_.push_front(id);
+  f.lru = lru_.begin();
+  Frame& ref = frames_.emplace(id, std::move(f)).first->second;
+  if (id >= table_.size()) table_.resize(std::max<size_t>(id + 1, table_.size() * 2), nullptr);
+  table_[id] = &ref;
+  evictIfNeeded(id);
+  return ref;
+}
+
 Pager::Frame& Pager::frame(PageId id, bool load_from_disk) {
   if (id < table_.size() && table_[id]) {
     Frame& f = *table_[id];
@@ -173,8 +195,17 @@ void Pager::read(PageId id, char* out) {
   if (id == kInvalidPage || id >= meta_.page_count) {
     throw CorruptionError("read of out-of-range page " + std::to_string(id));
   }
+  {
+    LockGuard lock(cache_mu_);
+    if (Frame* f = cachedFrame(id)) {
+      std::memcpy(out, f->data.data(), kPageSize);
+      return;
+    }
+  }
+  std::vector<char> buf(kPageSize);
+  loadFromDisk(id, buf.data());  // without the cache lock, as in visit()
   LockGuard lock(cache_mu_);
-  std::memcpy(out, frame(id, true).data.data(), kPageSize);
+  std::memcpy(out, installLoaded(id, std::move(buf)).data.data(), kPageSize);
 }
 
 void Pager::write(PageId id, const char* in) {

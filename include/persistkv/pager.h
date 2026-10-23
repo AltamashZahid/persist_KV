@@ -79,8 +79,19 @@ class Pager {
     if (id == kInvalidPage || id >= meta_.page_count) {
       throw CorruptionError("read of out-of-range page " + std::to_string(id));
     }
+    {
+      LockGuard lock(cache_mu_);
+      if (Frame* f = cachedFrame(id)) {
+        fn(static_cast<const char*>(f->data.data()));
+        return;
+      }
+    }
+    // A miss reads (and checksums) the page without the cache lock, so
+    // misses from several threads overlap; then the first copy cached wins.
+    std::vector<char> buf(kPageSize);
+    loadFromDisk(id, buf.data());
     LockGuard lock(cache_mu_);
-    fn(static_cast<const char*>(frame(id, true).data.data()));
+    fn(static_cast<const char*>(installLoaded(id, std::move(buf)).data.data()));
   }
   void write(PageId id, const char* in);
 
@@ -125,6 +136,10 @@ class Pager {
   void release(Frame& f);  // clean and unpinned again: back into it
 
   Frame& frame(PageId id, bool load_from_disk);  // cache_mu_ must be held
+  Frame* cachedFrame(PageId id);                  // a hit (moved to the LRU front), or null; cache_mu_ held
+  // Caches a page read from disk, unless another thread cached it first
+  // (then that copy is returned). cache_mu_ held.
+  Frame& installLoaded(PageId id, std::vector<char> data);
   void loadFromDisk(PageId id, char* out);
   void evictIfNeeded(PageId keep);  // cache_mu_ must be held
   void recoverDoublewrite();
