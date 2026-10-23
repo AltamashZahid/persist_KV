@@ -273,6 +273,12 @@ void DB::scan(const std::string& lo, const std::string& hi, const ScanFn& fn) {
   tree_.scan(lo, hi.empty() ? nullptr : &hi, fn);
 }
 
+void DB::scanRawReverse(const std::string& lo, const std::string& hi_exclusive, const RawScanFn& fn) {
+  ensureUsable();
+  SharedLock lock(tree_mu_);
+  tree_.scanRawReverse(hi_exclusive.empty() ? nullptr : &hi_exclusive, lo, fn);
+}
+
 void DB::scanRaw(const std::string& lo, const std::string& hi, const RawScanFn& fn) {
   ensureUsable();
   SharedLock lock(tree_mu_);

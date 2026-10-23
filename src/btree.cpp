@@ -485,6 +485,68 @@ void BTree::scanRaw(const std::string& lo, const std::string* hi, const RawScanF
   }
 }
 
+// Leaves link only forward, so a reverse scan re-descends for each leaf:
+// to the leaf holding the largest key below `bound`, noting the separator
+// just left of the path (every key in that leaf is >= it). After the leaf is
+// walked backwards, that separator becomes the new bound.
+void BTree::scanRawReverse(const std::string* hi, const std::string& lo, const RawScanFn& fn) {
+  char page[kPageSize];
+  std::string bound = hi ? *hi : std::string();
+  bool bounded = hi != nullptr;
+  std::string overflow, fence;
+  while (true) {
+    PageId id = pager_.meta().root;
+    bool has_fence = false;
+    while (true) {
+      pager_.read(id, page);
+      if (isLeafPage(page, id)) break;
+      size_t count = keyCount(page, id, false);
+      size_t base = slotBase(false, count);
+      size_t idx = count;  // the child holding keys just below the bound
+      if (bounded) {       // first separator >= bound
+        size_t a = 0, b = count;
+        while (a < b) {
+          size_t mid = (a + b) / 2;
+          uint16_t len;
+          const char* k = keyAt(page, id, base, mid, &len);
+          if (bound.compare(0, bound.size(), k, len) <= 0) b = mid;
+          else a = mid + 1;
+        }
+        idx = a;
+      }
+      if (idx > 0) {  // deeper separators are tighter
+        uint16_t len;
+        const char* k = keyAt(page, id, base, idx - 1, &len);
+        fence.assign(k, len);
+        has_fence = true;
+      }
+      id = get32(page + kPageHeaderSize + 4 * idx);
+    }
+
+    size_t count = keyCount(page, id, true);
+    size_t end = bounded ? leafLowerBound(page, id, count, bound) : count;
+    for (size_t i = end; i-- > 0;) {
+      Reader r{page, id, slotAt(page, id, kPageHeaderSize, i)};
+      uint16_t klen = r.u16();
+      const char* k = r.bytes(klen);
+      size_t clen;
+      const char* c = r.cell(&clen);
+      if (lo.compare(0, lo.size(), k, klen) > 0) return;  // below the start key
+      bool more;
+      if (static_cast<uint8_t>(c[0]) == kCellInline) {
+        more = fn(k, klen, c + 3, get16(c + 1));
+      } else {
+        readCell(std::string(c, clen), &overflow);
+        more = fn(k, klen, overflow.data(), overflow.size());
+      }
+      if (!more) return;
+    }
+    if (!has_fence) return;  // that was the leftmost leaf
+    bound = fence;
+    bounded = true;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Modification
 //

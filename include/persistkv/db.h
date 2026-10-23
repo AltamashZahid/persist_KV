@@ -110,6 +110,9 @@ class DB {
   // are valid only during the call. Same range rules as scan(). Faster when
   // the caller decodes entries itself instead of keeping them.
   void scanRaw(const std::string& lo, const std::string& hi, const RawScanFn& fn);
+  // Like scanRaw, but newest-first: keys >= lo and < hi_exclusive (empty =
+  // no upper bound), in descending order, until fn returns false.
+  void scanRawReverse(const std::string& lo, const std::string& hi_exclusive, const RawScanFn& fn);
 
   void checkpoint();  // synchronous
   uint64_t size();

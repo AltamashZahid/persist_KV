@@ -87,6 +87,9 @@ class BTree {
   // Like scan, but without building a Node or copying keys and values: the
   // callback sees bytes straight from the leaf page.
   void scanRaw(const std::string& lo, const std::string* hi, const RawScanFn& fn);
+  // Keys in [lo, *hi) (no upper bound when hi is null) in descending order,
+  // until fn returns false.
+  void scanRawReverse(const std::string* hi, const std::string& lo, const RawScanFn& fn);
 
   uint32_t height();
 

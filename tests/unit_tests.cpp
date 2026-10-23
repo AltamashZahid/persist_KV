@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <memory>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -251,6 +252,43 @@ TEST(cache_stays_bounded_once_pages_are_clean) {
   std::string v;
   for (int i = 0; i < 100000; i += 7) db.get(key(i), &v);  // touches every page
   CHECK(db.stats().cached_pages <= 64);
+  CHECK_HEALTHY(db);
+}
+
+TEST(reverse_scan_matches_forward_scan) {
+  Options o = fastOptions();
+  o.cache_pages = 32;
+  DB db(freshDir("reverse_scan"), o);
+  std::mt19937 rng(13);
+  std::map<std::string, std::string> want;
+  for (int i = 0; i < 6000; i++) {
+    std::string k = key(rng() % 9000);
+    std::string v(rng() % 20 == 0 ? 600 + rng() % 1000 : rng() % 60, 'a' + i % 26);
+    db.put(k, v);
+    want[k] = v;
+  }
+  for (int i = 0; i < 1500; i++) {  // deletes leave separators that are no longer keys
+    std::string k = key(rng() % 9000);
+    db.remove(k);
+    want.erase(k);
+  }
+  for (int round = 0; round < 60; round++) {
+    std::string lo = round % 5 == 0 ? "" : key(rng() % 9500);
+    std::string hi = round % 7 == 0 ? "" : key(rng() % 9500);
+    std::vector<std::pair<std::string, std::string>> expect;
+    for (const auto& kv : want) {
+      if (kv.first >= lo && (hi.empty() || kv.first < hi)) expect.push_back(kv);
+    }
+    std::reverse(expect.begin(), expect.end());
+    size_t limit = round % 3 == 0 ? 25 : SIZE_MAX;
+    if (expect.size() > limit) expect.resize(limit);
+    std::vector<std::pair<std::string, std::string>> got;
+    db.scanRawReverse(lo, hi, [&](const char* k, size_t kl, const char* v, size_t vl) {
+      got.emplace_back(std::string(k, kl), std::string(v, vl));
+      return got.size() < limit;
+    });
+    CHECK(got == expect);
+  }
   CHECK_HEALTHY(db);
 }
 
